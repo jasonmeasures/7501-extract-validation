@@ -1,0 +1,44 @@
+# Virtual Environment
+venv/
+venv.backup.*/
+env/
+ENV/
+
+# Environment Variables
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Logs
+*.log
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+debug_dashboard.html
+
+# Output files (optional - uncomment if you don't want to track outputs)
+# /tmp/cbp_uploads/
+# /tmp/cbp_outputs/
+
