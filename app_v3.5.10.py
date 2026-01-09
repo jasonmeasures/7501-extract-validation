@@ -9,6 +9,8 @@ import io
 from PyPDF2 import PdfReader, PdfWriter
 import logging
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import zipfile
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
@@ -44,575 +46,1412 @@ API1_WORKFLOW_ID = None  # IMPORTANT: Get this from AI79 dashboard to enable pol
                          # Set it here: API1_WORKFLOW_ID = "wf_xxxxxxxxxxxx"
 
 # Custom instructions for API 1 (entire document)
-API1_CUSTOM_INSTRUCTIONS = """CBP Form 7501 Entry Summary - LLM Extraction Instructions
-
-🚨 CRITICAL RULES (Must Follow)
-
-1. PRIMARY HTS IDENTIFICATION
-If files show 99-series as primary HTS:
-- The primary HTS code MUST ALWAYS be the actual 10-digit merchandise classification code
-- NEVER use codes starting with "99" as the primary HTS
-- 99-series codes (9903.01.24, 9903.88.02, etc.) are ALWAYS additional tariff codes
-
-How to identify:
-- Look for the 10-digit code with the product description
-- The primary HTS describes what is actually being imported (e.g., "ceramic sinks", "machinery parts")
-- All codes starting with "99" go into additional_hts_codes array
-
-Examples:
-- ✅ Correct Primary: 6910.10.0030, 8486.90.0000, 3926.90.9880
-- ❌ Wrong Primary: 9903.01.24, 9903.88.02, 9903.01.25
+# Using CBP Form 7501 Master Extraction Prompt v3.0
+API1_CUSTOM_INSTRUCTIONS = """
+# CBP Form 7501 Master Extraction Prompt v2
+## Comprehensive System for All Brokers
+## Enhanced with Validation Rules & Edge Case Handling
 
 ---
 
-2. ADDITIONAL HTS NESTING
-If additional_hts at line level:
-- Additional HTS codes MUST be nested under primary_hts.additional_hts_codes[]
-- NEVER place additional_hts_codes at the line item level
-- This is a CRITICAL nesting requirement
+# SECTION 1: SYSTEM OVERVIEW
 
-Structure:
-❌ WRONG:
-{
-  "line_number": "001",
-  "additional_hts_codes": [...]  // At line level - WRONG!
-}
+You are extracting data from U.S. Customs and Border Protection Form 7501 (Entry Summary). This form documents merchandise entering U.S. commerce and calculates duties, taxes, and fees owed.
 
-✅ CORRECT:
-{
-  "line_number": "001",
-  "primary_hts": {
-    "hts_code": "6910.10.0030",
-    "additional_hts_codes": [...]  // Nested under primary_hts - CORRECT!
-  }
-}
+## 1.1 MANDATORY DATA HIERARCHY (THREE LEVELS)
+
+```
+LEVEL 1: SHIPMENT (KEY_VALUE_PAIR)
+├── Appears ONCE per entry
+├── Entry identification, transport, parties, totals
+├── Addresses (CONSIGNEE, IMPORTER, BROKER)
+│
+└── LEVEL 2: LINE_ITEM
+    ├── Repeats per product line (001, 002, 003...)
+    ├── Product description, weights, values, invoice data
+    ├── Country of origin AT LINE LEVEL (can differ from shipment)
+    │
+    └── LEVEL 3: LINE_ITEM_LEVEL_II
+        ├── Repeats per HTS code within each line item
+        ├── MULTIPLE HTS codes possible per single line item
+        ├── HTS classification, rates, duties, fees (MPF, HMF, Dairy, Cotton)
+        └── Each HTS entry can have its own rate and duty calculation
+```
+
+**CRITICAL**: A single LINE_ITEM (e.g., Line 001) can have MULTIPLE LINE_ITEM_LEVEL_II entries. For USMCA goods, expect 3+ HTS codes per line item.
+
+## 1.2 STANDARD KEYS ENFORCEMENT
+
+**RULE: Only use keys from the US_Keys.xlsx reference file.**
+
+Common Mapping Errors to Avoid:
+| WRONG | CORRECT |
+|-------|---------|
+| P_N | PART_NUMBER |
+| P/N | PART_NUMBER |
+| PN | PART_NUMBER |
+| delivery_order_no | (EXCLUDE - not CBP 7501 data) |
+| sender | (EXCLUDE - not CBP 7501 data) |
+| receiver | (EXCLUDE - not CBP 7501 data) |
+| dates | (EXCLUDE - use specific date keys) |
+| other_details | (EXCLUDE - map to specific keys or omit) |
 
 ---
 
-3. FEES NESTING
-If fees at wrong level:
-- Fees (MPF, HMF) MUST be nested under primary_hts.fees
-- NEVER place fees at line item level
-- NEVER place fees inside the additional_hts_codes array
-- MPF and HMF do NOT have HTS codes - they are text labels only
+# SECTION 2: FORM VERSION DETECTION (CRITICAL)
 
-Structure:
-❌ WRONG - At line level:
-{
-  "line_number": "001",
-  "fees": {...}  // WRONG!
-}
+## 2.1 Version Detection Patterns
 
-❌ WRONG - In additional_hts_codes:
+Different form versions have DIFFERENT block layouts. Detecting the wrong version causes systematic extraction errors.
+
+### Version 7/21 or 2/18 (OLD FORMAT)
+```
+Detection Patterns:
+- "CBP Form 7501 (7/21)"
+- "CBP Form 7501 (2/18)"
+- "OMB APPROVAL NO. 1651-0022"
+- "EXPIRATION DATE 01/31/2021"
+
+Block Layout:
+- Blocks 21-24: Location, Consignee, Importer, Reference
+- Line Items: Columns 27-34
+- Totals: Blocks 35-43
+```
+
+### Version 10/25 (NEW FORMAT - October 2025)
+```
+Detection Patterns:
+- "CBP Form 7501 (10/25)"
+- "OMB CONTROL NUMBER 1651-0022"
+- "EXPIRATION DATE 11/30/2025"
+
+Block Layout:
+- Blocks 21-24: Section 232 Steel/Aluminum fields (NEW)
+- Blocks 25-28: Location, Consignee, Importer, Reference (SHIFTED +4)
+- Line Items: Columns 31-38 (SHIFTED +4)
+- Totals: Blocks 39-47 (SHIFTED +4)
+```
+
+### Version 5/22
+```
+Detection Patterns:
+- "CBP Form 7501 (5/22)"
+- "PAPERLESS" header
+
+Block Layout: Same as 7/21 (OLD FORMAT)
+```
+
+## 2.2 Block Mapping Tables
+
+### OLD FORMAT (7/21, 2/18, 5/22)
+| Block | Field |
+|-------|-------|
+| 21 | Location of Goods/G.O. Number |
+| 22 | Consignee Number |
+| 23 | Importer Number |
+| 24 | Reference Number |
+| 25 | Ultimate Consignee Name and Address |
+| 26 | Importer of Record Name and Address |
+| 27 | Line Number |
+| 28 | Description of Merchandise |
+| 29 | HTSUS No. / AD/CVD No. |
+| 30 | Gross Weight / Manifest Qty |
+| 31 | Net Quantity in HTSUS Units |
+| 32 | Entered Value / CHGS / Relationship |
+| 33 | HTSUS Rate / AD/CVD Rate / IRC Rate / Visa |
+| 34 | Duty and IR Tax |
+| 35 | Total Entered Value |
+| 37 | Duty |
+| 38 | Tax |
+| 39 | Other |
+| 40 | Total |
+| 41 | Declarant Name/Title/Signature/Date |
+| 42 | Broker/Filer Information |
+| 43 | Broker/Importer File Number |
+
+### NEW FORMAT (10/25)
+| Block | Field |
+|-------|-------|
+| 21 | Country of Melt and Pour (Steel Section 232) |
+| 22 | Primary Country of Smelt (Aluminum Section 232) |
+| 23 | Secondary Country of Smelt (Aluminum Section 232) |
+| 24 | Country of Cast (Aluminum Section 232) |
+| 25 | Location of Goods/G.O. Number |
+| 26 | Consignee Number |
+| 27 | Importer Number |
+| 28 | Reference Number |
+| 29 | Ultimate Consignee Name and Address |
+| 30 | Importer of Record Name and Address |
+| 31 | Line Number |
+| 32 | Description of Merchandise |
+| 33 | HTSUS No. / AD/CVD No. |
+| 34 | Gross Weight / Manifest Qty |
+| 35 | Net Quantity in HTSUS Units |
+| 36 | Entered Value / CHGS / Relationship |
+| 37 | HTSUS Rate / AD/CVD Rate / IRC Rate / Visa |
+| 38 | Duty and IR Tax |
+| 39 | Total Entered Value |
+| 41 | Duty |
+| 42 | Tax |
+| 43 | Other |
+| 44 | Total |
+| 45 | Declarant Name/Title/Signature/Date |
+| 46 | Broker/Filer Information |
+| 47 | Broker/Importer File Number |
+
+---
+
+# SECTION 3: BROKER-SPECIFIC PATTERNS
+
+## 3.1 Broker Identification
+
+| Broker | Filer Code | Entry Number Format | Primary Port | Primary Mode |
+|--------|------------|---------------------|--------------|--------------|
+| **GEODIS** | 916 | 916-XXXXXXX-X | 4601, 1102 | 11 (Vessel) |
+| **BDP** | BDP, B12 | BDP-XXXXXXX-X | Various | 11 (Vessel), 40 (Air) |
+| **KIS** | KIS | KIS-XXXXXXX-X | 2304 (Laredo) | 30 (Truck) |
+| **EFP** | EFP | EFP-XXXXXXX-X | 2303, 2304 | 30 (Truck), 21 (Rail) |
+| **CH Robinson** | CHR, CRW | CHR-XXXXXXX-X | Various | Various |
+| **Expeditors** | EXP, EII | EXP-XXXXXXX-X | Various | Various |
+| **DHL** | DHL, DGF | DHL-XXXXXXX-X | Various | 40 (Air) |
+| **UPS** | UPS, USC | UPS-XXXXXXX-X | Various | 40 (Air) |
+| **Kuehne+Nagel** | KNI, KNL | KNI-XXXXXXX-X | Various | Various |
+| **FedEx** | FTN, FED | FTN-XXXXXXX-X | Various | 40 (Air) |
+
+## 3.2 CRITICAL: Filer Code vs Broker Name
+
+**RULE: The filer code in the entry number determines the FILING broker, which may differ from the broker name printed on the form.**
+
+Example:
+```
+Entry Number: 916-5187505-5
+Filer Code: 916 = GEODIS (the filing broker)
+Broker Name on Form: BDP INTERNATIONAL (the broker of record)
+
+In this case:
+- GEODIS (filer code 916) is electronically filing the entry
+- BDP is the licensed customs broker handling the account
+- Both are valid; extraction should note BOTH:
+  - FILER_CODE: "916" (from entry number)
+  - BROKER_NAME: "BDP INTERNATIONAL" (from Box 42/46)
+```
+
+## 3.3 GEODIS Broker Specifics
+
+```
+Broker Name: GEODIS USA LLC
+Filer Code: 916
+Address: 75 Northfield Ave, US Building B Edison, NJ 08837
+Phone: +17326236600
+
+Characteristics:
+- Heavy vessel (container) traffic from Asia and Europe
+- Form versions: 7/21, 2/18
+- Declarants: Florentin Milagros, Romero Stephanie
+- BOL format: MEDUXXNNNNNN, IILUXXXXXXXXXX
+- Importer: Primarily The Hershey Company
+- Origins: VN, ID, BR, MY, IE, CN
+```
+
+## 3.4 BDP Broker Specifics
+
+```
+Broker Name: BDP International
+Filer Codes: BDP, B12
+Address: 206 Eddystone Ave, 2nd Floor, Crum Lynne, PA 19022
+Phone: 1-844-209-8752
+
+Characteristics:
+- Mixed vessel and air shipments
+- Global origin coverage (Ireland, Asia, Europe)
+- Form versions: 7/21, 2/18
+- Multiple MFR IDs common
+- AD/CVD handling for Chinese goods
+- Often uses GEODIS (916) as filer
+```
+
+## 3.5 KIS Broker Specifics
+
+```
+Broker Name: KIS Customs
+Filer Code: KIS
+Entry Format: KIS-XXXXXXX-X
+
+Characteristics:
+- Land border (Mexico-US via Laredo)
+- Mode 30 (Truck)
+- USMCA origin goods (MX primarily)
+- Form versions: 7/21, 2/18
+- BOL format: CINLKISXXXXXXXX or [Carrier]KISXXXXXXXX
+
+CRITICAL - CHGS Field Usage:
+KIS uses Box 32B (CHGS) for SPI codes, NOT freight charges:
+- C50 = USMCA preferential treatment
+- C100 = US Goods Returned
+- C300 = US Goods Returned (specific provision)
+```
+
+## 3.6 EFP Broker Specifics
+
+```
+Broker Name: Raul S. Villarreal dba PG Customs Brokers
+Filer Code: EFP
+Address: 416 Shiloh Dr Ste C2, Laredo, TX 78045-6755
+Phone: 956-790-0010
+
+Characteristics:
+- Land border (Mexico-US via Laredo)
+- Mode 30 (Truck), Mode 21 (Rail)
+- USMCA origin goods
+- Form versions: 5/22, 2/18
+- Product codes: XXXXX-XXXXX-XXX format
+- Declarant: Raul S. Villarreal, Attorney-in-Fact
+
+SPI Patterns:
+- MX EO USMCA = Mexico Eligible Origin USMCA
+- CA EO USCMA = Canada Eligible Origin USMCA
+- S = Statistical reporting
+- S+ = Statistical + Additional (quota goods)
+```
+
+---
+
+# SECTION 4: DATA SOURCE FILTERING
+
+## 4.1 CBP 7501 Data vs Non-7501 Data
+
+**CRITICAL: Extract ONLY from CBP Form 7501. Exclude delivery orders, packing lists, commercial invoices, and manifest data.**
+
+### Include (CBP 7501 Only):
+- Entry number, dates, parties from Blocks 1-30/34
+- Line item data from Columns 27-34 / 31-38
+- Totals from Blocks 35-43 / 39-47
+- Declarant and broker info from Blocks 41-43 / 45-47
+- Fee summary (499, 501, 056, 110, etc.)
+
+### EXCLUDE These Non-Standard Fields:
+| Field to EXCLUDE | Reason |
+|------------------|--------|
+| `delivery_order_no` | Delivery order data, not CBP 7501 |
+| `sender` | Delivery order section |
+| `receiver` | Delivery order section |
+| `dates` (as object) | Use specific date keys instead |
+| `other_details` | Map to specific keys or omit |
+| `P_N` | Use `PART_NUMBER` |
+| `unique_id` | Not a US_Keys field (use ITEM_NUMBER) |
+
+### Exclude Document Types:
+- Delivery Order data (dates, carrier, voyage, delivery instructions)
+- Packing List data (container contents, piece counts)
+- Manifest data (container numbers, seal numbers)
+- Commercial Invoice data (unless mapping to line items)
+- Any field not in US_Keys.xlsx standard keys
+
+### Handling Multi-Document Packages:
+```
+If package contains multiple documents:
+1. Identify the CBP Form 7501 pages (look for "CBP Form 7501" header)
+2. Extract ONLY from those pages
+3. Ignore delivery orders, packing lists, invoices
+4. Note: page_count should reflect ONLY 7501 pages
+5. cbp_7501_line_count should reflect ONLY valid 7501 line items
+```
+
+## 4.2 Line Item Number Validation
+
+**RULE: Valid CBP 7501 line items use 3-digit numbering (001, 002, 003...).**
+
+### Valid Line Numbers:
+- 001, 002, 003... 099, 100, 101...
+- Format: 3 digits, zero-padded
+
+### Invalid/Suspect Line Numbers:
+- 0001, 0002... (4-digit) = Likely manifest/packing list data
+- 1, 2, 3... (no padding) = May need formatting
+- A, B, C... (alpha) = Likely different document
+
+### Example:
+```json
+// CORRECT - CBP 7501 line items only
+"items": [
+  {"ITEM_NUMBER": "001", ...}
+]
+
+// WRONG - Mixed with manifest data
+"items": [
+  {"ITEM_NUMBER": "001", ...},    // CBP 7501
+  {"ITEM_NUMBER": "0001", ...},   // Manifest - EXCLUDE
+  {"ITEM_NUMBER": "0002", ...}    // Manifest - EXCLUDE
+]
+```
+
+## 4.3 Single-Line Entry with Multiple Containers
+
+**CRITICAL: Many entries have ONE actual 7501 line item but MULTIPLE containers/shipments.**
+
+### Pattern Recognition:
+```
+CBP 7501 Entry Summary:
+- Line 001: HTS 1806.20.2400, Value $1,433,417, Duty $71,670.85 ← ACTUAL 7501 LINE
+- Lines 002-013: Container breakdowns with no values/duties ← INFORMATIONAL ONLY
+- Items 0001-0010: Manifest data ← EXCLUDE ENTIRELY
+
+Result: This is a SINGLE LINE ITEM entry, not 13+ line items
+```
+
+### Indicators of Container Breakdown Lines (NOT Actual 7501 Lines):
+| Indicator | Example | Action |
+|-----------|---------|--------|
+| No ITEM_ENTERED_VALUE | null, blank | Exclude from line_items |
+| No DUTY_AND_TAXES | null, blank | Exclude from line_items |
+| HTSUS_RATE = "N/A" | Rate not applicable | Exclude from line_items |
+| Description = "SAID TO CONTAIN" | Manifest language | Exclude entirely |
+| Description = "X BAG(S) of Y BAGS" | Container breakdown | Exclude from line_items |
+| 4-digit item number | 0001, 0002 | Exclude entirely |
+
+### Decision Algorithm:
+```python
+def is_valid_7501_line_item(item):
+    # Must have 3-digit format
+    if len(item.ITEM_NUMBER) != 3:
+        return False
+    
+    # Must have actual value OR duty
+    if item.ITEM_ENTERED_VALUE is None and item.DUTY_AND_TAXES is None:
+        return False
+    
+    # Must not be manifest language
+    if "SAID TO CONTAIN" in item.PRODUCT_DESCRIPTION:
+        return False
+    
+    # Must have valid HTS rate (not "N/A")
+    if all(hts.HTSUS_RATE == "N/A" for hts in item.hts_data):
+        return False
+    
+    return True
+```
+
+### Correct Extraction for Single-Line Entry:
+```json
 {
-  "additional_hts_codes": [
+  "extraction_metadata": {
+    "total_document_items": 23,
+    "valid_7501_line_items": 1,
+    "excluded_container_breakdowns": 12,
+    "excluded_manifest_items": 10
+  },
+  "line_items": [
     {
-      "hts_code": "9903.01.24",
-      "fees": {...}  // WRONG!
+      "ITEM_NUMBER": "001",
+      "PRODUCT_DESCRIPTION": "COCO IN PRP CON OV 5.5 BFA",
+      "PART_NUMBER": "496308",
+      "ITEM_ENTERED_VALUE": 1433417,
+      "hts_data": [
+        {"HTS_US_CODE": "1806.20.2400", "HTSUS_RATE": "5%", "DUTY_AND_TAXES": 71670.85}
+      ]
     }
   ]
 }
-
-✅ CORRECT - Under primary_hts:
-{
-  "primary_hts": {
-    "hts_code": "6910.10.0030",
-    "fees": {
-      "mpf": {...},
-      "hmf": {...}
-    }  // CORRECT!
-  }
-}
-
----
-
-4. CHARGE_TYPE PLACEMENT
-If charge_type in wrong places:
-- charge_type should ONLY appear at the line item level
-- NEVER place charge_type inside primary_hts
-- NEVER place charge_type inside additional_hts_codes
-
-Structure:
-❌ WRONG - Nested in primary_hts:
-{
-  "primary_hts": {
-    "charge_type": "C1"  // WRONG!
-  }
-}
-
-✅ CORRECT - At line item level:
-{
-  "line_number": "001",
-  "charge_type": "C1",  // CORRECT!
-  "primary_hts": {...}
-}
-
----
-
-5. CONFIDENCE SCORES
-If missing confidence scores:
-- Confidence scores are REQUIRED at all major data levels
-- Add confidence_score (0.0 to 1.0) to:
-  - Line item level
-  - Primary HTS level
-  - Each quantity object
-  - Each additional HTS code
-  - Each fee
-  - Invoice values
-
-Example:
-{
-  "line_number": "001",
-  "confidence_score": 0.95,
-  "primary_hts": {
-    "hts_code": "6910.10.0030",
-    "confidence_score": 0.98,
-    "quantity": {
-      "value": "22100",
-      "unit": "KG",
-      "confidence_score": 0.99
-    },
-    "additional_hts_codes": [
-      {
-        "hts_code": "9903.01.24",
-        "confidence_score": 0.96
-      }
-    ],
-    "fees": {
-      "mpf": {
-        "amount": 61.85,
-        "confidence_score": 0.94
-      }
-    }
-  }
-}
-
----
-
-SHIPMENT-LEVEL INFORMATION
-
-Extract all information appearing ABOVE line item 001 in the item block area.
-
-Manifest Information (Above First Line) - CRITICAL: Extract FIRST
-
-**CRITICAL**: Extract Master Bill, House Bill, and Manifest Quantity that appear in the section above line 001.
-
-**Common format:**
-```
-M: 61547419260          1 PCS
-H: 5768871732
 ```
 
-**Extract as:**
+## 4.4 Continuation Sheet vs Manifest Data
+
+**CRITICAL: Distinguish CBP 7501 continuation sheets from manifest/packing list pages.**
+
+### CBP 7501 Continuation Sheet Indicators:
+- Header: "ENTRY SUMMARY CONTINUATION SHEET"
+- Includes: Entry Number (Block 1)
+- Columns: Same structure as main form (27-34 / 31-38)
+- Line numbers continue sequence (002, 003, etc.)
+
+### Manifest/Packing List Indicators:
+- Different headers (no "CBP Form 7501")
+- Container numbers, seal numbers
+- "SAID TO CONTAIN" descriptions
+- 4-digit item numbers (0001, 0002)
+- Missing HTS codes, values, duties
+
+### Decision Rule:
+```
+IF page has "CBP Form 7501" header OR "ENTRY SUMMARY" header:
+    → Include as 7501 data
+ELSE IF page has HTS codes, duties, values in 7501 format:
+    → Include as continuation data
+ELSE:
+    → Exclude (manifest/delivery order/packing list)
+```
+
+---
+
+# SECTION 5: SHIPMENT LEVEL EXTRACTION (KEY_VALUE_PAIR)
+
+## 5.1 Required Fields
+
+| STANDARD_KEY | Box (Old) | Box (New) | Format/Example | Notes |
+|--------------|-----------|-----------|----------------|-------|
+| ENTRY_NUMBER | 1 | 1 | XXX-XXXXXXX-X | 11 alphanumeric |
+| ENTRY_TYPE | 2 | 2 | 01, 03, 06, 11, 21 + ABI/A, ABI/P | Entry type + ABI indicator |
+| SUMMARY_DATE | 3 | 3 | MM/DD/YYYY | Filing date |
+| SURETY_NUMBER | 4 | 4 | 001, 998, 999 | 3-digit code |
+| BOND_TYPE | 5 | 5 | 0, 8, 9 | Single digit |
+| PORT_OF_ENTRY | 6 | 6 | DDPP (4 digits) | Schedule D code |
+| ENTRY_DATE | 7 | 7 | MM/DD/YYYY | Release date |
+| MODE_OF_TRANSPORT | 9 | 9 | 10, 11, 20, 21, 30, 31, 40, 41 | 2-digit code |
+| COUNTRY_OF_ORIGIN | 10 | 10 | 2-letter ISO or MULTI | Country code |
+| IMPORT_DATE | 11 | 11 | MM/DD/YYYY | Arrival date |
+| BOL_NUMBER | 12 | 12 | SCAC + Number | Bill of lading |
+| MANUFACTURER_ID | 13 | 13 | 15-char MID or MULTI | Manufacturer code |
+| EXPORT_COUNTRY | 14 | 14 | 2-letter ISO or MULTI | Exporting country |
+| EXPORT_DATE | 15 | 15 | MM/DD/YYYY or MULTI | Export date |
+| IT_NUMBER | 16 | 16 | IT number | Immediate transport |
+| IT_DATE | 17 | 17 | MM/DD/YYYY | IT date |
+| MISSING_DOCS | 18 | 18 | 01, 10, 16, etc. | Document codes |
+| PORT_OF_LADING | 19 | 19 | 5-digit Schedule K | Foreign port |
+| PORT_OF_UNLADING | 20 | 20 | 4-digit code | US port |
+| LOCATION_FIRMS_CODE | 21 | 25 | FIRMS code | Location of goods |
+| CONSIGNEE_ID | 22 | 26 | NN-NNNNNNN or SAME | EIN format |
+| IMPORTER_ID | 23 | 27 | NN-NNNNNNN | EIN format |
+| REF_NUMBER | 24 | 28 | EIN format | Reference party |
+| TOTAL_ENTERED_VALUE | 35 | 39 | USD amount | Sum of line values |
+| TOTALS_DUTY | 37 | 41 | USD amount | Total duty |
+| TOTALS_TAX | 38 | 42 | USD amount | Total tax |
+| TOTAL_OTHER_FEES | 39 | 43 | USD amount | Total other fees |
+| DUTY_GRAND_TOTAL | 40 | 44 | USD amount | Sum of 37+38+39 |
+| DECLARANT_NAME | 41 | 45 | Name | Person signing |
+| BROKER_CODE | 43 | 47 | Broker file number | Internal reference |
+
+## 5.2 Fee Summary Fields (Shipment Level)
+
+| STANDARD_KEY | Code | Description | Notes |
+|--------------|------|-------------|-------|
+| MPF_AMOUNT | 499 | Merchandise Processing Fee | ACTUAL BILLED (after min/max) |
+| HARBOR_MAINTENANCE | 501 | Harbor Maintenance Fee | Vessel only (Mode 10, 11, 12) |
+| COTTON_AMOUNT | 056 | Cotton Fee | Agricultural fee |
+| Dairy_AMOUNT | 110 | Dairy Fee | Agricultural fee |
+
+## 5.3 Section 232 Fields (10/25 Version Only)
+
+| STANDARD_KEY | Box | Description |
+|--------------|-----|-------------|
+| COUNTRY_MELT_POUR | 21 | Steel: Country where raw steel first produced/poured |
+| PRIMARY_COUNTRY_SMELT | 22 | Aluminum: Largest volume country of smelt |
+| SECONDARY_COUNTRY_SMELT | 23 | Aluminum: Second largest volume country |
+| COUNTRY_CAST | 24 | Aluminum: Country where last liquified/cast |
+
+---
+
+# SECTION 6: ADDRESS EXTRACTION
+
+## 6.1 Address Types
+
+| ADDRESS Type | Box (Old) | Box (New) | STANDARD_KEY |
+|--------------|-----------|-----------|--------------|
+| Ultimate Consignee | 25 | 29 | CONSIGNEE |
+| Importer of Record | 26 | 30 | IMPORTER |
+| Broker/Filer | 42 | 46 | BROKER |
+
+## 6.2 Address Fields (ADDRESS_FIELD)
+
+| STANDARD_KEY | Description |
+|--------------|-------------|
+| NAME | Company/person name |
+| ACTOR_ID | ID number (EIN/SSN) |
+| STREET_NUMBER | House/building number |
+| STREET_NAME | Street name |
+| UNSTRUCTURED_STREET_ADDRESS | Full street line |
+| CITY | City name |
+| COUNTRY_SUB_ENTITY | State (2-letter code) |
+| POSTAL_CODE | ZIP code |
+| COUNTRY | Country code |
+
+## 6.3 "SAME" Consignee Handling
+
+When Consignee Number (Box 22/26) = "SAME":
+- Skip CONSIGNEE address extraction
+- Set CONSIGNEE to null or note "SAME AS IMPORTER"
+- Do NOT copy Importer data to Consignee fields
+- Consignee is identical to Importer of Record
+
+---
+
+# SECTION 7: LINE ITEM EXTRACTION (LINE_ITEM)
+
+## 7.1 Required Fields
+
+| STANDARD_KEY | Column (Old) | Column (New) | Notes |
+|--------------|--------------|--------------|-------|
+| ITEM_NUMBER | 27 | 31 | Sequential: 001, 002, 003... |
+| PRODUCT_DESCRIPTION | 28 | 32 | Merchandise description |
+| PART_NUMBER | 28 | 32 | Product code/SKU (NOT P_N) |
+| ITEM_GROSS_WEIGHT | 30A | 34A | Gross weight in KG |
+| ITEM_MANIFEST_QTY | 30B | 34B | Manifest quantity |
+| NET_WEIGHT_QTY | 31 | 35 | Net quantity in HTS units |
+| WEIGHT_UNITS | 31 | 35 | Unit of measure (KG, NO, DOZ) |
+| ITEM_ENTERED_VALUE | 32A | 36A | USD value |
+| ITEM_CHARGES | 32B | 36B | Charges OR SPI code (broker-specific) |
+| RELATIONSHIP | 32C | 36C | Y = Related, N = Not related |
+| MANUFACTURER_ID | 13 | 13 | Line-level MFR ID |
+| COUNTRY_OF_ORIGIN | Derived | Derived | See derivation rules |
+
+## 7.2 Optional Line Item Fields
+
+| STANDARD_KEY | Source | Notes |
+|--------------|--------|-------|
+| INVOICE_NUMBER | 28/Description area | Invoice reference |
+| INVOICE_AMOUNT | Invoice total | Per-line invoice value |
+| PO_NUMBER | Description area | Purchase order |
+| COMMERCIAL_DESCRIPTION | 28 | Detailed product description |
+| TEXTILE_CATEGORY | 29C | CAT NNN format |
+
+## 7.3 Incomplete Line Item Handling
+
+**SCENARIO: Line items 002+ may have incomplete data (no value, no duty)**
+
+### Possible Reasons:
+1. **Continuation of Line 001** - Same product, different container
+2. **Informational Line** - Manifest data included on form
+3. **Apportioned Entry** - Values consolidated on first line
+
+### Handling Rules:
+```
+IF line has HTS code AND duty amount:
+    → Full extraction
+ELSE IF line has HTS code but NO value/duty:
+    → Extract available fields, note incomplete
+ELSE IF line has description only:
+    → May be manifest/informational, flag for review
+```
+
+### Example:
 ```json
 {
-  "shipment_info": {
-    "manifest_info": {
-      "master_bill": {
-        "label": "M",
-        "value": "61547419260",
-        "confidence_score": 0.98
-      },
-      "house_bill": {
-        "label": "H", 
-        "value": "5768871732",
-        "confidence_score": 0.98
-      },
-      "manifest_qty": {
-        "value": "1",
-        "unit": "PCS",
-        "confidence_score": 0.99
-      }
+  "ITEM_NUMBER": "002",
+  "PRODUCT_DESCRIPTION": "IRISH CHOCOLATE MILK CRUMB IN POWDERED FORM",
+  "ITEM_GROSS_WEIGHT": "25411 KG",
+  "NET_WEIGHT_QTY": "22 BAG",
+  "MANUFACTURER_ID": "IEORNCOODUB",
+  "COUNTRY_OF_ORIGIN": "IE",
+  "ITEM_ENTERED_VALUE": null,
+  "ITEM_CHARGES": null,
+  "_extraction_note": "Continuation line - no separate value"
+}
+```
+
+## 7.4 Country of Origin Derivation Rules (LINE ITEM LEVEL)
+
+**Priority Order:**
+
+| Priority | Rule | Source | Example | Result |
+|----------|------|--------|---------|--------|
+| 1 | O + 2-digit code | Line item text | OUS, OMX | US, MX |
+| 2 | MFR ID first 2 chars | MANUFACTURER_ID | USHERCOM6HAZ | US |
+| 3 | Shipment-level COO | Box 10 | MX | MX |
+
+```
+Algorithm:
+1. Search line item data for pattern "O" + 2-letter code (OUS, OMX, OCN)
+   → If found, use the 2-letter code as COUNTRY_OF_ORIGIN
+   
+2. If no O+XX code, check MANUFACTURER_ID at line level
+   → Extract first 2 characters (e.g., "IE" from "IEORNCOODUB")
+   → Validate against ISO country codes
+   → Use as COUNTRY_OF_ORIGIN
+   
+3. If no line-level MFR ID, use shipment-level COUNTRY_OF_ORIGIN (Box 10)
+
+4. If shipment COO = "MULTI", each line MUST have individual COO
+```
+
+---
+
+# SECTION 8: HTS/DUTY EXTRACTION (LINE_ITEM_LEVEL_II)
+
+## 8.1 Required Fields
+
+| STANDARD_KEY | Column (Old) | Column (New) | Notes |
+|--------------|--------------|--------------|-------|
+| HTS_US_CODE | 29A | 33A | 10-digit HTS code WITH PERIODS |
+| HTS_DESCRIPTION | 28 | 32 | HTS-level description |
+| HTSUS_RATE | 33A | 37A | FREE or percentage |
+| ESTIMATED_VALUE | 32A | 36A | Value per HTS line |
+| DUTY_AND_TAXES | 34 | 38 | Calculated duty amount |
+| AD_CVD_CASE_NUMBER | 29B | 33B | A-XXX-XXX-XXX format |
+| AD_CVD_RATE | 33B | 37B | AD/CVD rate |
+
+## 8.2 HTS Code Formatting (CRITICAL)
+
+**RULE: Always format HTS codes with periods in standard positions.**
+
+### Correct Format:
+```
+XXXX.XX.XXXX
+Examples:
+- 1806.20.2400 ✓
+- 9903.88.15 ✓
+- 3924.90.5650 ✓
+```
+
+### Incorrect Formats to Fix:
+```
+1806202400 → 1806.20.2400
+990388.15 → 9903.88.15
+3924905650 → 3924.90.5650
+```
+
+### Formatting Algorithm:
+```
+IF HTS has no periods AND length >= 8:
+    Insert period after position 4
+    Insert period after position 6
+    Result: XXXX.XX.XXXX
+```
+
+## 8.3 Fee Codes vs HTS Codes
+
+**CRITICAL: Distinguish fee codes from HTS codes in LINE_ITEM_LEVEL_II.**
+
+### Fee Codes (Extract to Separate Fee Fields):
+| Pattern | Fee Type | STANDARD_KEY |
+|---------|----------|--------------|
+| 499 | MPF | MPF_FEE |
+| 501 | HMF | HMF_FEE |
+| 056 | Cotton | COTTON_FEE_AMOUNT |
+| 110 | Dairy | Dairy_FEE |
+
+### Handling:
+```
+IF code is 499, 501, 056, 110:
+    → Extract as fee field, NOT as HTS code
+    → Include in hts_data array with fee-specific keys
+    
+Example:
+{
+  "HTS_US_CODE": "499 MPF",
+  "HTSUS_RATE": "0.3464%",
+  "DUTY_AND_TAXES": 4965.36,
+  "MPF_FEE": 4965.36,
+  "MPF_RATE": "0.3464%",
+  "_is_fee": true
+}
+```
+
+## 8.4 Multiple HTS Codes Per Line Item
+
+**CRITICAL**: USMCA and Chinese goods often have multiple HTS codes per line item.
+
+### USMCA Pattern (Mexico/Canada Origin):
+```
+Line 001:
+├── HTS 1: 9903.01.04 (IEEPA Exclusion) → FREE, $0.00
+├── HTS 2: 9903.01.27 (Reciprocal Exclusion) → FREE, $0.00
+└── HTS 3: 1806.90.9019 (Primary HTS) → FREE, $0.00
+```
+
+### Irish/European Goods Pattern (Dutiable):
+```
+Line 001:
+├── HTS 1: 1806.20.2400 (Primary HTS) → 5%, $71,670.85
+├── 499 MPF: 0.3464% → $4,965.36 (calculated, capped at $538.40)
+├── 501 HMF: 0.125% → $1,791.77
+└── 110 Dairy: 1.327% → $503.60
+```
+
+### Chinese Goods Pattern (Section 301):
+```
+Line 005:
+├── HTS 1: 9903.88.15 (Section 301 - 7.5%) → 7.5%, $1,234.88
+├── HTS 2: 9903.01.24 (Section 301 - 10%) → 10%, $1,646.50
+├── HTS 3: 3924.90.5650 (Primary HTS) → 3.4%, $559.81
+└── 499 MPF: 0.3464% → $57.03
+```
+
+## 8.5 HTS Code Types
+
+| Code Pattern | Type | Description |
+|--------------|------|-------------|
+| 9903.01.XX | USMCA Chapter 99 | Trade agreement provisions |
+| 9903.88.XX | Section 301 | China tariff codes |
+| 9823.10.01 | Sugar quota | Sugar-containing goods |
+| 1XXX-8XXX | Primary HTS | Actual product classification |
+| 98XX.XX.XXXX | Chapter 98 | Special provisions |
+
+---
+
+# SECTION 9: FEE RULES
+
+## 9.1 Fee Code Reference
+
+| Code | Fee Name | STANDARD_KEY (Total) | STANDARD_KEY (Line) | Rate |
+|------|----------|---------------------|---------------------|------|
+| 499 | Merchandise Processing Fee | MPF_AMOUNT | MPF_FEE | 0.3464% |
+| 501 | Harbor Maintenance Fee | HARBOR_MAINTENANCE | HMF_FEE | 0.125% |
+| 056 | Cotton Fee | COTTON_AMOUNT | COTTON_FEE_AMOUNT | Variable |
+| 110 | Dairy Fee | Dairy_AMOUNT | Dairy_FEE | Variable |
+
+## 9.2 MPF Rules (CRITICAL)
+
+```
+Rate: 0.3464% ad valorem
+Minimum: $27.75 per entry
+Maximum: $538.40 per entry (for single-line entries)
+
+Calculation:
+calculated_mpf = entered_value * 0.003464
+if calculated_mpf < 27.75: actual_mpf = 27.75
+elif calculated_mpf > 538.40: actual_mpf = 538.40
+else: actual_mpf = calculated_mpf
+```
+
+### CRITICAL: Line-Level vs Shipment-Level MPF Discrepancy
+
+**This is a common source of confusion. The numbers WILL differ.**
+
+| Level | What It Shows | Example |
+|-------|--------------|---------|
+| LINE-LEVEL (hts_data) | CALCULATED amount (before cap) | $4,965.36 |
+| SHIPMENT-LEVEL | ACTUAL BILLED amount (after cap) | $538.40 |
+
+### Example Explanation:
+```
+Entry Value: $1,433,417
+Calculated MPF: $1,433,417 × 0.003464 = $4,965.36
+Maximum Cap: $538.40
+Actual Billed: $538.40 (capped)
+
+In extraction:
+- Line 001 hts_data shows: MPF_FEE = $4,965.36 (calculated)
+- Shipment shows: MPF_AMOUNT = $538.40 (actual billed after cap)
+
+THIS IS CORRECT - both values serve different purposes
+```
+
+### Multi-Line Entry MPF:
+```
+For entries with multiple dutiable line items:
+- Each line item gets its own MPF cap calculation
+- Total MPF = sum of all line-level capped MPFs
+- Maximum possible = (number of lines) × $538.40
+
+Example with 3 dutiable lines:
+- Line 001: Value $500,000, Calculated MPF $1,732, Capped to $538.40
+- Line 002: Value $300,000, Calculated MPF $1,039.20, Capped to $538.40
+- Line 003: Value $50,000, Calculated MPF $173.20, Actual $173.20 (under cap)
+- Total MPF: $538.40 + $538.40 + $173.20 = $1,250.00
+```
+
+### MPF Anomaly Detection:
+```
+Flag for review if:
+1. Shipment MPF > $538.40 for single-line entry
+2. Shipment MPF < $27.75 for dutiable entry
+3. Shipment MPF differs significantly from expected cap calculation
+4. Line-level MPF shows $0 for dutiable non-FTA goods
+
+Common causes of anomalies:
+- Multiple entries consolidated
+- Informal entry (different MPF rules)
+- Prior disclosure or penalty
+- Data entry error in source document
+```
+
+### MPF Exemptions:
+```
+FTA goods with proper SPI are MPF-EXEMPT:
+- S, S+ (USMCA) → MPF = $0
+- A (GSP) → MPF = $0
+- AU, BH, CL, CO, IL, JO, KR, MA, OM, P, PA, PE, SG → MPF = $0
+
+If FTA SPI present, both:
+- Line-level MPF_FEE should be $0 or absent
+- Shipment-level MPF_AMOUNT should be $0 or absent
+```
+
+## 9.3 HMF Rules
+
+```
+Rate: 0.125% ad valorem
+
+CRITICAL: HMF only applies to VESSEL transport!
+
+Mode Check:
+- Mode 10, 11, 12 (Vessel) → HMF applies
+- Mode 20, 21 (Rail) → HMF = 0
+- Mode 30, 31 (Truck) → HMF = 0
+- Mode 40, 41 (Air) → HMF = 0
+
+Algorithm:
+if mode_of_transport in ['10', '11', '12']:
+    hmf = entered_value * 0.00125
+else:
+    hmf = 0.00
+```
+
+## 9.4 Fee Extraction Pattern
+
+```
+Look for pattern in Other Fee Summary section:
+
+499  MPF                    538.40
+501  Harbor Maintenance    1791.77
+056  Cotton Fee              45.00
+110  Dairy                  503.60
+
+Regex: (499|501|056|110)\s+\w+.*?\s+([\d,]+\.?\d*)
+```
+
+---
+
+# SECTION 10: SPECIAL PROGRAM INDICATORS (SPI)
+
+## 10.1 SPI Code Categories
+
+### Primary FTA Codes (Establishes Rate)
+| Code | Agreement/Program |
+|------|-------------------|
+| A | GSP (Generalized System of Preferences) |
+| AU | United States-Australia FTA |
+| BH | United States-Bahrain FTA |
+| CA | NAFTA - Canada (DISCONTINUED, use S) |
+| CL | United States-Chile FTA |
+| CO | United States-Colombia TPA |
+| E | Caribbean Basin Economic Recovery Act |
+| IL | United States-Israel FTA |
+| JO | United States-Jordan FTA |
+| JP | United States-Japan Trade Agreement |
+| KR | United States-Korea FTA (KORUS) |
+| MA | United States-Morocco FTA |
+| MX | NAFTA - Mexico (DISCONTINUED, use S) |
+| OM | United States-Oman FTA |
+| P | CAFTA-DR |
+| PA | United States-Panama TPA |
+| PE | United States-Peru TPA |
+| S | USMCA (US-Mexico-Canada Agreement) |
+| S+ | USMCA - Agricultural TRQ, staging, textile TPL |
+| SG | United States-Singapore FTA |
+
+### Secondary Codes (Can Combine with Primary)
+| Code | Description |
+|------|-------------|
+| F | Folklore Products |
+| G | Made to Measure Suits (Hong Kong) |
+| H | Special Regime Garments |
+| M | Fashion Samples |
+| V | Set Component (GRI 3b/3c) |
+| X | Set Header (Rate from this item) |
+
+### US Goods Codes (9802 Provisions)
+| Code | Provision |
+|------|-----------|
+| 01 | 9802.00.5010 - Articles repaired/assembled abroad |
+| 02 | 9802.00.8040 - Articles repaired/assembled abroad |
+| 03 | 9802.00.6000 - Metal articles processed/returned |
+| 04-12 | Various textile and apparel provisions |
+
+## 10.2 SPI Combination Rules
+
+```
+Format: [Primary/Country].[Secondary]
+
+Examples:
+- A.F = GSP + Folklore
+- S.V = USMCA + Set Component
+- KR.X = Korea FTA + Set Header
+
+Rules:
+- Maximum 1 Primary/Country code
+- Can add multiple secondary codes
+- V and X are mutually exclusive with each other
+```
+
+## 10.3 Broker-Specific SPI Patterns
+
+### KIS Broker (CHGS Field = SPI)
+```
+Box 32B shows SPI codes, NOT charges:
+- C50 = USMCA preferential
+- C100 = US Goods Returned
+- C300 = US Goods Returned (specific)
+```
+
+### EFP Broker (Inline SPI)
+```
+SPI appears inline with line item:
+- "MX EO USMCA" = Mexico Eligible Origin USMCA
+- "CA EO USCMA" = Canada Eligible Origin USMCA
+- "S 2106.90.9985" = Statistical reporting HTS
+- "S+ 9823.10.01" = Statistical + quota
+```
+
+---
+
+# SECTION 11: VALIDATION RULES
+
+## 11.1 Entry Number Validation
+
+```
+Pattern: XXX-XXXXXXX-X
+
+Components:
+- Filer Code: 3 alphanumeric characters
+- Entry Number: 7 digits
+- Check Digit: 1 digit (calculated)
+
+Known Filer Codes: 916, BDP, B12, KIS, EFP, GEO, G09, CHR, DHL, UPS, KNI, FTN
+```
+
+## 11.2 Value Validation
+
+```
+TOTAL_ENTERED_VALUE == sum(line_items.ITEM_ENTERED_VALUE)
+
+Note: Only sum items with actual values (skip null/continuation items)
+Tolerance: ±$1.00 for rounding
+```
+
+## 11.3 Totals Validation
+
+```
+DUTY_GRAND_TOTAL == TOTALS_DUTY + TOTALS_TAX + TOTAL_OTHER_FEES
+
+Tolerance: ±$0.01 for rounding
+```
+
+## 11.4 MULTI Field Validation
+
+```
+If COUNTRY_OF_ORIGIN == 'MULTI':
+    Each LINE_ITEM MUST have individual COUNTRY_OF_ORIGIN
+
+If MANUFACTURER_ID == 'MULTI':
+    Each LINE_ITEM MUST have individual MANUFACTURER_ID
+```
+
+## 11.5 HMF Transport Mode Validation
+
+```
+If MODE_OF_TRANSPORT not in ['10', '11', '12']:
+    HARBOR_MAINTENANCE must be 0.00
+    All HMF_FEE values must be 0.00
+```
+
+## 11.6 Fee Cap Validation
+
+```
+MPF Validation:
+- If single line: MPF_AMOUNT should be between $27.75 and $538.40
+- If multiple lines: Each line's MPF should be capped individually
+- Total MPF = sum of capped line MPFs
+
+MPF Discrepancy Check:
+- calculated_mpf = TOTAL_ENTERED_VALUE × 0.003464
+- If MPF_AMOUNT significantly differs from calculated, verify:
+  - Multiple line items (each capped separately)
+  - FTA exemptions (USMCA, GSP = $0 MPF)
+  - Entry type exemptions
+```
+
+## 11.7 MPF Anomaly Detection
+
+**Flag these scenarios for review:**
+
+| Scenario | Example | Likely Cause |
+|----------|---------|--------------|
+| Shipment MPF > $538.40 (single line) | $614.35 | Multiple containers billed separately, data error, or prior disclosure penalty |
+| Shipment MPF < $27.75 (dutiable) | $15.00 | Partial entry, adjustment, or data error |
+| Shipment MPF = $0 (dutiable, no FTA) | $0.00 | Missing data or exemption not captured |
+| Line MPF ≠ 0.3464% × value | Off by >$1 | Rate changed or calculation error |
+
+### Specific Case: MPF Exceeds Single-Entry Cap
+```
+If MPF_AMOUNT > $538.40 for what appears to be single-line entry:
+
+Possible explanations:
+1. Entry covers multiple entries consolidated (check ENTRY_NUMBER pattern)
+2. Multiple informal entries (different MPF rules)
+3. Prior disclosure penalty included
+4. Data entry error in source document
+5. Container-level MPF billing (unusual but possible)
+
+Action: 
+- Flag in validation_results
+- Include note: "MPF $614.35 exceeds standard cap $538.40 - review source"
+- Do NOT automatically adjust the value
+```
+
+### Validation Output Example:
+```json
+"validation_results": {
+  "mpf_validation": {
+    "shipment_mpf": 614.35,
+    "expected_max": 538.40,
+    "status": "ANOMALY",
+    "flag": "MPF exceeds standard single-entry cap",
+    "possible_causes": [
+      "Multiple entries consolidated",
+      "Prior disclosure penalty",
+      "Data entry error"
+    ]
+  }
+}
+```
+
+---
+
+# SECTION 12: EXTRACTION DO's AND DON'Ts
+
+## 12.1 DO's
+
+✓ Detect form version FIRST before extracting any fields
+✓ Use correct block mapping for detected version
+✓ Extract MULTIPLE HTS codes per line item
+✓ Derive line-level COUNTRY_OF_ORIGIN using priority rules
+✓ Handle "SAME" consignee correctly
+✓ Set HMF to 0 for non-vessel transport
+✓ Validate totals against sum of line items
+✓ Include all three hierarchy levels in output
+✓ Map fields to US_Keys.xlsx standard keys only
+✓ Format HTS codes with periods (XXXX.XX.XXXX)
+✓ Distinguish fee codes (499, 501, etc.) from HTS codes
+✓ Note filer code vs broker name differences
+✓ Exclude non-7501 data (delivery orders, packing lists)
+✓ Count only VALID 7501 line items (with values/duties)
+✓ Exclude container breakdown lines (no value, no duty)
+✓ Flag MPF anomalies (> $538.40 for single entry)
+✓ Document excluded items in metadata
+
+## 12.2 DON'Ts
+
+✗ DO NOT mix up form versions - block numbers differ!
+✗ DO NOT assume one HTS code per line item
+✗ DO NOT treat KIS CHGS field as charges (it's SPI codes)
+✗ DO NOT apply HMF to non-vessel shipments
+✗ DO NOT forget to derive line-level country of origin
+✗ DO NOT create keys that don't exist in US_Keys.xlsx
+✗ DO NOT duplicate fees at both line and shipment level
+✗ DO NOT assume Consignee address exists - check for "SAME"
+✗ DO NOT extract table headers as data values
+✗ DO NOT invent values - only extract what exists
+✗ DO NOT use `P_N` instead of `PART_NUMBER`
+✗ DO NOT include 4-digit item numbers (manifest data)
+✗ DO NOT include delivery order fields (sender, receiver, dates)
+✗ DO NOT include `unique_id` field (use ITEM_NUMBER)
+✗ DO NOT count container breakdowns as valid line items
+✗ DO NOT include lines with HTS rate "N/A" and no values
+✗ DO NOT include "SAID TO CONTAIN" manifest descriptions
+
+---
+
+# SECTION 13: OUTPUT FORMAT
+
+## 13.1 JSON Structure
+
+```json
+{
+  "extraction_metadata": {
+    "form_version": "2/18",
+    "filer_code": "916",
+    "broker": "BDP",
+    "extraction_date": "2024-07-07",
+    "page_count": 6,
+    "cbp_7501_pages": 2,
+    "total_document_items": 23,
+    "valid_7501_line_items": 1,
+    "excluded_items": {
+      "container_breakdowns": 12,
+      "manifest_items": 10
+    }
+  },
+  "shipment": {
+    "ENTRY_NUMBER": "916-5187505-5",
+    "ENTRY_TYPE": "02 ABI/P/L",
+    "SUMMARY_DATE": "07/17/2024",
+    "MODE_OF_TRANSPORT": "11",
+    "COUNTRY_OF_ORIGIN": "IE",
+    "TOTAL_ENTERED_VALUE": 1433417,
+    "MPF_AMOUNT": 538.40,
+    "HARBOR_MAINTENANCE": 1791.77,
+    "Dairy_AMOUNT": 503.60
+  },
+  "addresses": {
+    "CONSIGNEE": {
+      "NAME": "THE HERSHEY COMPANY",
+      "UNSTRUCTURED_STREET_ADDRESS": "19 E. CHOCOLATE AVE",
+      "CITY": "HERSHEY",
+      "COUNTRY_SUB_ENTITY": "PA",
+      "POSTAL_CODE": "17033"
+    },
+    "IMPORTER": { },
+    "BROKER": { }
+  },
+  "line_items": [
+    {
+      "ITEM_NUMBER": "001",
+      "PRODUCT_DESCRIPTION": "COCO IN PRP CON OV 5.5 BFA",
+      "PART_NUMBER": "496308",
+      "COUNTRY_OF_ORIGIN": "IE",
+      "MANUFACTURER_ID": "IEORNCOODUB",
+      "NET_WEIGHT_QTY": "264 BAG",
+      "ITEM_ENTERED_VALUE": 1433417,
+      "ITEM_CHARGES": "C24000",
+      "RELATIONSHIP": "NOT RELATED",
+      "hts_data": [
+        {
+          "HTS_US_CODE": "1806.20.2400",
+          "HTSUS_RATE": "5%",
+          "DUTY_AND_TAXES": 71670.85
+        },
+        {
+          "HTS_US_CODE": "499",
+          "HTSUS_RATE": "0.3464%",
+          "MPF_FEE": 4965.36,
+          "_is_fee": true,
+          "_note": "Calculated amount; actual billed is $538.40 (capped)"
+        },
+        {
+          "HTS_US_CODE": "501",
+          "HTSUS_RATE": "0.125%",
+          "HMF_FEE": 1791.77,
+          "_is_fee": true
+        },
+        {
+          "HTS_US_CODE": "110",
+          "HTSUS_RATE": "1.327%",
+          "Dairy_FEE": 503.60,
+          "_is_fee": true
+        }
+      ]
+    }
+  ],
+  "validation_results": {
+    "total_value_check": true,
+    "duty_total_check": true,
+    "hmf_mode_check": true,
+    "mpf_validation": {
+      "line_calculated": 4965.36,
+      "shipment_billed": 538.40,
+      "cap_applied": true,
+      "status": "VALID - capped at maximum"
+    },
+    "line_item_filtering": {
+      "items_in_document": 23,
+      "valid_7501_items": 1,
+      "excluded_reason": "12 container breakdowns (no values), 10 manifest items (4-digit numbers)"
     }
   }
 }
 ```
 
-**Variations:**
-- Master Bill may be labeled: "M:", "MASTER BILL:", "MASTER B/L:", "MBL:"
-- House Bill may be labeled: "H:", "HOUSE BILL:", "HOUSE B/L:", "HBL:"
-- Manifest QTY appears on same line as Master Bill or on separate line
-- Common units: PCS (pieces), PAL (pallets), CTN (cartons), PKG (packages)
+## 13.2 Field Naming Rules
 
-**Extraction Priority:**
-1. FIRST: Extract manifest_info (Master Bill, House Bill, Manifest Quantity)
-2. SECOND: Extract general info (PO numbers, invoices, containers)
-3. THIRD: Extract block_specific info (references blocks at shipment level)
+**CRITICAL: Use ONLY keys from US_Keys.xlsx**
 
-**Important Note:**
-- manifest_qty is ONLY at shipment level (shipment_info.manifest_info.manifest_qty)
-- This represents the total packaging quantity for the entire shipment
-- Do NOT extract manifest_qty at the line item level
+| WRONG | CORRECT |
+|-------|---------|
+| `P_N` | `PART_NUMBER` |
+| `unique_id` | (omit - use `ITEM_NUMBER`) |
+| `delivery_order_no` | (omit - not CBP 7501) |
+| `sender` | (omit - not CBP 7501) |
+| `receiver` | (omit - not CBP 7501) |
+| `dates` | (omit - use specific keys like `ENTRY_DATE`) |
+| `other_details` | (omit - map to specific keys or exclude) |
+| `total_items_count` | `valid_7501_line_items` in metadata |
 
----
+## 13.3 Handling Non-Standard Source Data
 
-Complete Extraction Structure
-
-Complete Line Item JSON Structure:
-
-{
-  "unique_id": "001",
-  "line_number": "001",
-  "invoice_number": "20250810-2",
-  "description": "CERM SINK & LAVATORY PORCEL/CH",
-  "item_number": "4022-708-21852",
-  "charge_type": "C1",
-  "SPI": "S",
-  "CO": "MX",
-  "confidence_score": 0.95,
-  "primary_hts": {
-    "hts_code": "6910.10.0030",
-    "description": "Ceramic sinks and lavatories",
-    "confidence_score": 0.98,
-    "quantity": {
-      "value": "22100",
-      "unit": "KG",
-      "confidence_score": 0.99
-    },
-    "quantity_2": {
-      "value": "2480",
-      "unit": "NO",
-      "confidence_score": 0.99
-    },
-    "net_quantity": {
-      "value": "2480",
-      "unit": "NO",
-      "confidence_score": 0.99
-    },
-    "gross_weight": {
-      "value": "22100",
-      "unit": "KG",
-      "confidence_score": 0.99
-    },
-    "rate": "5.80%",
-    "entered_value": 17856.00,
-    "dutiable_value": 17856.00,
-    "duty_amount": 1035.65,
-    "invoice_values": {
-      "giv": 17856.00,
-      "usd": 17856.00,
-      "niv": 17856.00,
-      "confidence_score": 0.97
-    },
-    "additional_hts_codes": [
-      {
-        "hts_code": "9903.01.24",
-        "description": "China tariff - Products of China",
-        "rate": "20.00%",
-        "entered_value": 17856.00,
-        "dutiable_value": 17856.00,
-        "duty_amount": 3571.20,
-        "confidence_score": 0.96
-      },
-      {
-        "hts_code": "9903.01.25",
-        "description": "IEEPA Reciprocal Exclusion",
-        "rate": "10.00%",
-        "entered_value": 17856.00,
-        "dutiable_value": 17856.00,
-        "duty_amount": 1785.60,
-        "confidence_score": 0.96
-      }
-    ],
-    "fees": {
-      "mpf": {
-        "description": "MERCHANDISE PROCESSING FEE",
-        "rate": ".3464%",
-        "amount": 61.85,
-        "confidence_score": 0.94
-      },
-      "hmf": {
-        "description": "HARBOR MAINTENANCE FEE",
-        "rate": ".125%",
-        "amount": 22.32,
-        "confidence_score": 0.94
-      }
-    }
-  }
-}
+When source document contains extra fields not in US_Keys:
+1. **If mappable**: Map to standard key (P_N → PART_NUMBER)
+2. **If CBP 7501 data but no key**: Note in extraction_metadata.unmapped_fields
+3. **If non-7501 data**: Exclude entirely (delivery orders, manifests)
+4. **If internal tracking**: Exclude from output (unique_id, etc.)
+```
 
 ---
 
-Detailed Field Extraction Rules
+# SECTION 14: QUICK REFERENCE TABLES
 
-Header Information
-Extract all header-level fields including:
-- Entry number, port codes, dates
-- Importer and consignee details
-- Surety and bond information
-- Carrier and transport details
-- Broker/filer information
+## 14.1 Mode of Transport Codes
 
-Line Items
+| Code | Description | HMF? |
+|------|-------------|------|
+| 10 | Vessel, non-container | YES |
+| 11 | Vessel, container | YES |
+| 12 | Border, Waterborne | YES |
+| 20 | Rail, non-container | NO |
+| 21 | Rail, container | NO |
+| 30 | Truck, non-container | NO |
+| 31 | Truck, container | NO |
+| 32 | Auto | NO |
+| 40 | Air, non-container | NO |
+| 41 | Air, container | NO |
+| 50 | Mail | NO |
+| 60 | Passenger, hand-carried | NO |
 
-Line Identification:
-- unique_id: Same as line number
-- line_number: 3-digit string with leading zeros ("001", "002")
+## 14.2 Entry Type Codes
 
-Invoice and Item Numbers:
-- invoice_number: Extract associated invoice number
-- item_number: Extract part/item number if present
+| Code | Type |
+|------|------|
+| 01 | Consumption - Free and Dutiable |
+| 02 | Consumption - Quota/Visa |
+| 03 | Consumption - AD/CVD |
+| 06 | FTZ Consumption |
+| 11 | Informal - Free and Dutiable |
+| 21 | Warehouse |
+| 23 | TIB (Temporary Importation Bond) |
+| 31 | Warehouse Withdrawal - Consumption |
 
-Charge Type:
-- Extract from Box 32 if present (e.g., "C1", "C107", "C565")
-- Place at line item level ONLY
+## 14.3 Bond Type Codes
 
-Box 27 - SPI and Country of Origin:
-- Extract data from Box 27 for each line item
-- SPI (Special Program Indicator): First character indicates free trade agreement type
-  - Common values: "S" (USMCA/NAFTA), "E" (other FTA), etc.
-  - Place in "SPI" field at line item level
-  - Example: If Box 27 shows "S O MX", extract "S" as SPI
-- CO (Country of Origin): Extract the two-letter country code
-  - This follows the origin indicator (usually "O")
-  - Place in "CO" field at line item level
-  - Example: If Box 27 shows "S O MX", extract "MX" as CO
-  - Common codes: MX (Mexico), CN (China), CA (Canada), etc.
+| Code | Type |
+|------|------|
+| 0 | U.S. Government / Not required |
+| 8 | Continuous |
+| 9 | Single Transaction |
 
-Structure for Box 27 data:
-{
-  "line_number": "001",
-  "SPI": "S",
-  "CO": "MX",
-  "charge_type": "C1",
-  ...
-}
+## 14.4 Relationship Codes
 
-Quantities - ALWAYS SEPARATE:
-- ALL quantities must have {value, unit} structure
-- Common fields at LINE LEVEL: quantity, quantity_2, net_quantity, gross_weight
-- Example: "22100 KG" → {"value": "22100", "unit": "KG"}
-- Example: "1 PCS" → {"value": "1", "unit": "PCS"}
-
-IMPORTANT - Manifest Quantity Location:
-- manifest_qty is ONLY extracted at HEADER/SHIPMENT level (shipment_info.manifest_info.manifest_qty)
-- Do NOT extract manifest_qty at the line item level
-- Manifest quantity represents total packaging for the entire shipment
-- Common manifest units: PCS (pieces), PAL (pallets), CTN (cartons), PKG (packages)
-
-Primary HTS (CRITICAL)
-
-Identification (Most Important Rule):
-1. Find the 10-digit merchandise classification code
-2. This describes the actual imported goods
-3. NEVER use a 99-series code as primary
-
-What to Extract:
-- hts_code: 10-digit code with dots (e.g., "6910.10.0030")
-- description: Product description
-- All quantities (separated into value/unit)
-- rate: Duty rate for this HTS
-- entered_value: Value entered for customs
-- dutiable_value: Dutiable value
-- duty_amount: Duty calculated
-- invoice_values: GIV, USD, NIV when available
-
-Additional HTS Codes (CRITICAL NESTING)
-
-Must be nested under primary_hts.additional_hts_codes[]
-
-What qualifies:
-- All 99-series codes (9903.01.24, 9903.01.25, 9903.88.02, etc.)
-- These represent additional duties/tariffs on the merchandise
-
-What to Extract for Each:
-{
-  "hts_code": "9903.01.24",
-  "description": "Description if available",
-  "rate": "20.00%",
-  "entered_value": 17856.00,
-  "dutiable_value": 17856.00,
-  "duty_amount": 3571.20,
-  "confidence_score": 0.96
-}
-
-Fees (CRITICAL NESTING)
-
-Must be nested under primary_hts.fees
-
-Key Facts:
-- MPF and HMF do NOT have HTS codes
-- They appear as text labels in the document
-- Extract only: description, rate, amount
-
-Structure:
-{
-  "mpf": {
-    "description": "MERCHANDISE PROCESSING FEE",
-    "rate": ".3464%",
-    "amount": 61.85,
-    "confidence_score": 0.94
-  },
-  "hmf": {
-    "description": "HARBOR MAINTENANCE FEE",
-    "rate": ".125%",
-    "amount": 22.32,
-    "confidence_score": 0.94
-  }
-}
-
-Summary Totals
-Extract from document footer/Box 39:
-- merchandise_processing_fee_total: Total MPF (code 499)
-- harbor_maintenance_fee_total: Total HMF (code 501)
-- total_duty: Total duties
-- total_entered_value: Sum of all entered values
+| Code | Meaning |
+|------|---------|
+| Y | Related parties |
+| N | Not related |
+| NOT RELATED | Not related (expanded) |
+| RELATED | Related (expanded) |
 
 ---
 
-Pre-Submission Validation Checklist
+# SECTION 15: TESTING CHECKLIST
 
-For EVERY line item, verify:
+Before deployment, verify:
 
-- [ ] Primary HTS is 10 digits (e.g., 6910.10.0030)
-- [ ] Primary HTS does NOT start with "99"
-- [ ] additional_hts_codes is nested under primary_hts (not at line level)
-- [ ] fees is nested under primary_hts (not at line level or in additional_hts)
-- [ ] charge_type is at line item level (not nested)
-- [ ] All quantities have {value, unit} structure
-- [ ] Confidence scores present at all required levels
+**Form Detection & Mapping**
+- [ ] Form version detection works for 7/21, 2/18, 5/22, 10/25
+- [ ] Block number mapping correct per version
+- [ ] Entry number validation passes for all broker formats
 
-If ALL checked → Submit
-If ANY unchecked → Fix before submitting
+**Field Standards**
+- [ ] All standard keys from US_Keys.xlsx used (no P_N, unique_id, etc.)
+- [ ] No non-7501 fields included (sender, receiver, dates, other_details)
+- [ ] PART_NUMBER used instead of P_N
+- [ ] No unique_id field (use ITEM_NUMBER only)
+
+**Line Item Filtering**
+- [ ] 4-digit item numbers excluded (0001, 0002 = manifest)
+- [ ] Container breakdown lines excluded (no value, no duty)
+- [ ] "SAID TO CONTAIN" items excluded
+- [ ] Lines with HTSUS_RATE = "N/A" and no values excluded
+- [ ] valid_7501_line_items count accurate
+- [ ] excluded_items metadata populated
+
+**HTS Extraction**
+- [ ] Multiple HTS codes extracted per line item
+- [ ] HTS codes formatted with periods (XXXX.XX.XXXX)
+- [ ] Fee codes (499, 501, 056, 110) distinguished from HTS codes
+
+**Country & SPI**
+- [ ] Country of origin derived correctly (O+XX, MFR ID, shipment)
+- [ ] SPI codes handled per broker pattern
+
+**Fee Validation**
+- [ ] MPF cap logic verified (min $27.75, max $538.40)
+- [ ] MPF anomalies flagged (> $538.40 for single entry)
+- [ ] Line-level vs shipment-level MPF discrepancy documented
+- [ ] HMF correctly set to 0 for non-vessel modes
+
+**Address Handling**
+- [ ] Addresses extracted for CONSIGNEE, IMPORTER, BROKER
+- [ ] "SAME" consignee handled correctly
+- [ ] Filer code vs broker name noted when different
+
+**Totals Validation**
+- [ ] Total entered value = sum of line item values
+- [ ] Duty grand total = duty + tax + other fees
+- [ ] Validation results populated in output
 
 ---
 
-Visual Hierarchy
+# SECTION 16: EXAMPLE CORRECTIONS
 
-Line Item (001)
-├─ unique_id: "001"
-├─ line_number: "001"
-├─ charge_type: "C1"              ← At line level
-├─ SPI: "S"                       ← Box 27: Special Program Indicator (FTA type)
-├─ CO: "MX"                       ← Box 27: Country of Origin (2-letter code)
-├─ confidence_score: 0.95
-└─ primary_hts
-   ├─ hts_code: "6910.10.0030"    ← 10-digit merchandise code
-   ├─ confidence_score: 0.98
-   ├─ quantities (all with value/unit)
-   ├─ additional_hts_codes         ← ALL 99-series codes here
-   │  ├─ 9903.01.24
-   │  └─ 9903.01.25
-   └─ fees                         ← MPF/HMF here
-      ├─ mpf
-      └─ hmf
+## 16.1 Before (Incorrect Extraction)
 
----
-
-Before/After Example (Real Extraction Error)
-
-❌ BEFORE (INCORRECT - Multiple Errors)
+```json
 {
-  "line_number": "001",
-  "additional_hts_codes": [
+  "delivery_order_no": "142400557",  // ❌ Non-7501 field
+  "total_items_count": 23,           // ❌ Includes manifest data
+  "items": [
     {
-      "hts_code": "8486.90.0000",
-      "charge_type": "C565",
-      "fees": {
-        "mpf": {"amount": 31.27}
-      }
+      "unique_id": "001",            // ❌ Non-standard key
+      "P_N": "496308",               // ❌ Should be PART_NUMBER
+      ...
+    },
+    {
+      "ITEM_NUMBER": "002",          // ❌ No value/duty - container breakdown
+      "hts_data": [{"HTS_US_CODE": "1806202400", "HTSUS_RATE": "N/A"}]
+    },
+    {
+      "ITEM_NUMBER": "0001",         // ❌ 4-digit = manifest data
+      ...
     }
   ],
-  "primary_hts": {
-    "hts_code": "9903.01.24",
-    "rate": "20%",
-    "duty_amount": 341.6
-  }
+  "sender": {...},                   // ❌ Non-7501 field
+  "receiver": {...},                 // ❌ Non-7501 field
+  "dates": {...},                    // ❌ Non-7501 field
+  "other_details": {...}             // ❌ Non-7501 field
 }
+```
 
-Errors:
-1. Primary HTS is 99-series (9903.01.24) - should be 10-digit
-2. additional_hts_codes at line level - should be nested under primary_hts
-3. charge_type in additional_hts_codes - should be at line level
-4. fees in additional_hts_codes - should be under primary_hts.fees
-5. Missing confidence scores
+## 16.2 After (Correct Extraction)
 
-✅ AFTER (CORRECT)
+```json
 {
-  "line_number": "001",
-  "charge_type": "C565",
-  "SPI": "S",
-  "CO": "MX",
-  "confidence_score": 0.95,
-  "primary_hts": {
-    "hts_code": "8486.90.0000",
-    "description": "Machinery parts and accessories",
-    "rate": "Free",
-    "duty_amount": 0,
-    "confidence_score": 0.98,
-    "additional_hts_codes": [
-      {
-        "hts_code": "9903.01.24",
-        "rate": "20%",
-        "duty_amount": 341.6,
-        "confidence_score": 0.96
-      }
-    ],
-    "fees": {
-      "mpf": {
-        "description": "MERCHANDISE PROCESSING FEE",
-        "rate": "0.3464%",
-        "amount": 31.27,
-        "confidence_score": 0.95
-      }
+  "extraction_metadata": {
+    "form_version": "2/18",
+    "filer_code": "916",
+    "broker": "BDP",
+    "total_document_items": 23,
+    "valid_7501_line_items": 1,
+    "excluded_items": {
+      "container_breakdowns": 12,
+      "manifest_items": 10
+    }
+  },
+  "shipment": {
+    "ENTRY_NUMBER": "916-5187505-5",
+    "MPF_AMOUNT": 614.35,
+    ...
+  },
+  "line_items": [
+    {
+      "ITEM_NUMBER": "001",
+      "PART_NUMBER": "496308",
+      "ITEM_ENTERED_VALUE": 1433417,
+      "hts_data": [
+        {"HTS_US_CODE": "1806.20.2400", "HTSUS_RATE": "5%", "DUTY_AND_TAXES": 71670.85}
+      ]
+    }
+  ],
+  "validation_results": {
+    "mpf_validation": {
+      "shipment_mpf": 614.35,
+      "expected_max": 538.40,
+      "status": "ANOMALY",
+      "flag": "MPF exceeds standard single-entry cap - review source"
+    },
+    "line_item_filtering": {
+      "items_in_document": 23,
+      "valid_7501_items": 1,
+      "excluded": "12 container breakdowns, 10 manifest items"
     }
   }
 }
+```
 
 ---
 
-Common Patterns in Documents
+*Master Prompt Version 3.0*
+*Enhanced with single-line entry handling, MPF anomaly detection, and strict data filtering*
+*Covers: GEODIS, BDP, KIS, EFP, CH Robinson, Expeditors, DHL, UPS, Kuehne+Nagel, FedEx*
+*Form Versions: 7/21, 2/18, 5/22, 10/25*
 
-Pattern 1: Multiple HTS Codes in Sequence
-When you see:
-001  CERAMIC SINK & LAVATORY PORCEL/CH
-     9903.01.24                    20.00%    3571.20
-     9903.01.25                    10.00%    1785.60
-     6910.10.0030    22100 KG      5.80%     1035.65
-
-Interpret as:
-- Primary HTS: 6910.10.0030 (the 10-digit merchandise code)
-- Additional HTS: 9903.01.24, 9903.01.25 (the 99-series codes)
-
-Pattern 2: Fees Appearing After HTS Codes
-When you see:
-     MERCHANDISE PROCESSING FEE     .3464%      61.85
-     HARBOR MAINTENANCE FEE         .125%       22.32
-
-Interpret as:
-- These are fees, NOT HTS codes
-- Place under primary_hts.fees
-- Extract description, rate, and amount only
-
-Pattern 3: Rate Column Alignment
-The rate in the rate column belongs to the HTS code on the same line:
-9903.01.24        20.00%  ← This rate belongs to 9903.01.24
-9903.01.25        10.00%  ← This rate belongs to 9903.01.25
-6910.10.0030       5.80%  ← This rate belongs to 6910.10.0030
-
----
-
-Summary of Critical Rules
-
-1. Primary HTS = 10-digit merchandise code (NEVER 99-series)
-2. additional_hts_codes nested under primary_hts (NEVER at line level)
-3. fees nested under primary_hts.fees (NEVER at line level or in additional_hts)
-4. charge_type at line item level (NEVER nested)
-5. Quantities always separated into {value, unit}
-6. Confidence scores at all levels (line, HTS, quantities, fees)
-
----
-
-Format Variations
-
-CBP Form 7501s may have different visual layouts, but:
-- The data structure remains consistent
-- The hierarchical relationships stay the same
-- Always apply these rules regardless of format
-
----
-
-End of Instructions - Follow these rules for all Entry Summary extractions"""
+"""
 
 # API 2 - Not currently used (kept for reference)
 # API2_AGENT_NAME = "Process Document Compressed"
@@ -1337,6 +2176,24 @@ class CBP7501Normalizer:
         df.to_excel(output_path, index=False, engine='openpyxl')
         
         return output_path
+    
+    def to_json(self, normalized_data: List[Dict], output_path: str, indent: int = 2, extracted_data: Dict = None, raw_a79_data: Dict = None) -> str:
+        """Export JSON exactly as it comes from A79 - header + items array, no modifications"""
+        # Prefer raw_a79_data (unparsed) over extracted_data (parsed) to preserve all header fields
+        if raw_a79_data:
+            output = raw_a79_data
+        elif extracted_data:
+            output = extracted_data
+        else:
+            raise ValueError("No data to export")
+        
+        # Export exactly as it comes from A79 - no modifications, no normalization
+        # This preserves all header fields (document_type, filer_code_entry_number, etc.)
+        # and the items array exactly as A79 returns it
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(output, f, indent=indent, ensure_ascii=False)
+        
+        return output_path
 
 
 def split_pdf_by_pages(filepath):
@@ -1437,7 +2294,13 @@ def call_api(api_key, api_url, pdf_base64, custom_instructions, agent_name, work
     print(f"      📦 Payload keys: {list(payload.keys())}")
     print(f"      📦 Agent inputs: {list(payload['agent_inputs'].keys())}")
     
-    # Convert to JSON string
+    # Validate API key before making request
+    if not api_key or api_key.strip() == '':
+        error_msg = "API key is empty. Please set A79_API_KEY environment variable."
+        logger.error(error_msg)
+        raise Exception(error_msg)
+    
+    # Convert to JSON string for logging
     payload_json = json.dumps(payload)
     logger.debug(f"Payload JSON size: {len(payload_json)} characters")
     
@@ -1447,13 +2310,17 @@ def call_api(api_key, api_url, pdf_base64, custom_instructions, agent_name, work
         'Accept': '*/*'
     }
     logger.debug(f"Request headers: {headers}")
+    # Don't log the full API key, just confirm it's set
+    logger.debug(f"Authorization header set: {'Yes' if api_key else 'No'}")
     
     logger.info(f"Sending POST request to {api_url}")
     start_time = time.time()
     
+    # Use json= parameter instead of data= to match test files and ensure proper serialization
+    # This automatically sets Content-Type and handles JSON encoding
     response = requests.post(
         api_url,
-        data=payload_json,
+        json=payload,  # Pass dict directly, requests will serialize it
         headers=headers,
         timeout=REQUEST_TIMEOUT
     )
@@ -1467,7 +2334,13 @@ def call_api(api_key, api_url, pdf_base64, custom_instructions, agent_name, work
     print(f"      ⏱️  Request time: {request_time:.2f}s")
     
     if response.status_code != 200:
-        error_msg = f"API Error {response.status_code}: {response.text[:200]}"
+        # Provide more specific error messages
+        if response.status_code == 401:
+            error_msg = "API Error 401: Unauthorized - Invalid or missing API key. Please check your A79_API_KEY environment variable."
+        elif response.status_code == 500:
+            error_msg = f"API Error 500: Internal server error from A79 API. Response: {response.text[:200]}"
+        else:
+            error_msg = f"API Error {response.status_code}: {response.text[:200]}"
         logger.error(f"API request failed: {error_msg}")
         print(f"      ❌ {error_msg}")
         raise Exception(error_msg)
@@ -1774,7 +2647,7 @@ def process_document_with_api(filepath, filename):
         
         # Process entire PDF with API 1
         print(f"\n   📋 Processing entire document...")
-        extracted_data = call_api(
+        raw_a79_response = call_api(
             API_KEY,
             API_BASE_URL,
             pdf_base64,
@@ -1787,18 +2660,22 @@ def process_document_with_api(filepath, filename):
         # Save raw response
         debug_file = filepath.replace('.pdf', '_api1_response.json')
         with open(debug_file, 'w') as f:
-            json.dump(extracted_data, f, indent=2)
+            json.dump(raw_a79_response, f, indent=2)
         print(f"      ✅ Raw response saved: {debug_file}")
         
         # Parse the AI79 page-based response format
         print(f"\n   🔄 Parsing AI79 response format...")
-        parsed_data = parse_ai79_response(extracted_data)
+        parsed_data = parse_ai79_response(raw_a79_response)
         
         # Save parsed response
         parsed_file = filepath.replace('.pdf', '_parsed_response.json')
         with open(parsed_file, 'w') as f:
             json.dump(parsed_data, f, indent=2)
         print(f"      ✅ Parsed response saved: {parsed_file}")
+        
+        # Return both raw and parsed - store raw in a way that can be accessed
+        # Attach raw response to parsed data for later retrieval
+        parsed_data['_raw_a79_response'] = raw_a79_response
         
         return parsed_data
             
@@ -2094,6 +2971,11 @@ def validate_api_response(data: dict) -> bool:
     return True
 
 
+@app.route('/favicon.ico')
+def favicon():
+    """Return empty favicon to prevent 404 errors"""
+    return '', 204
+
 @app.route('/')
 def index():
     """Render the web interface"""
@@ -2296,9 +3178,9 @@ def index():
 
         <div class="upload-area" id="uploadArea">
             <div class="upload-icon">📄</div>
-            <div class="upload-text">Drag & Drop your CBP 7501 PDF here</div>
-            <p style="margin-top: 10px; color: #666;">or click to browse</p>
-            <input type="file" id="fileInput" style="display: none;" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff">
+            <div class="upload-text">Drag & Drop CBP 7501 PDF(s) here</div>
+            <p style="margin-top: 10px; color: #666;">or click to browse (multiple files supported)</p>
+            <input type="file" id="fileInput" style="display: none;" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" multiple>
         </div>
 
         <div class="file-info" id="fileInfo">
@@ -2307,7 +3189,7 @@ def index():
         </div>
 
         <button class="process-button" id="processButton">
-            Extract & Generate Excel (80 Columns)
+            Extract & Generate JSON (Parallel Processing)
         </button>
 
         <div class="loading" id="loading">
@@ -2317,18 +3199,20 @@ def index():
 
         <div class="success-message" id="successMessage">
             <div style="font-weight: 600; color: #2e7d32; margin-bottom: 10px;">✅ Processing Complete!</div>
-            <div style="color: #555;">Excel file with 80 columns downloaded successfully</div>
+            <div style="color: #555;" id="successDetails">JSON file downloaded successfully</div>
         </div>
 
         <div class="feature-list">
             <h3>📊 Complete Field Extraction</h3>
             <ul>
-                <li>80 standardized Excel columns</li>
+                <li>JSON output format with metadata</li>
                 <li>All CS (Customs Summary) fields</li>
                 <li>All CM (Customs Merchandise) fields</li>
                 <li>All CD (Customs Duty) fields</li>
                 <li>One row per HTS code/line item</li>
                 <li>Complete duty and fee breakdowns</li>
+                <li>✨ Parallel processing for multiple PDFs</li>
+                <li>✨ Batch processing with ZIP download</li>
             </ul>
         </div>
 
@@ -2365,7 +3249,7 @@ def index():
     </div>
 
     <script>
-        let selectedFile = null;
+        let selectedFiles = [];
 
         async function fetchByRunId() {
             const runIdInput = document.getElementById('runIdInput');
@@ -2394,10 +3278,9 @@ def index():
                 
                 if (response.ok && result.success) {
                     runIdStatus.style.color = '#2e7d32';
-                    runIdStatus.innerHTML = '✅ Results fetched! Processing to Excel...';
+                    runIdStatus.innerHTML = '✅ Results fetched! Processing to JSON...';
                     
                     // Now process the data through the normalization endpoint
-                    // Send the data to process-json-data endpoint
                     const processResponse = await fetch('/process-json-data', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -2409,16 +3292,16 @@ def index():
                         const url = window.URL.createObjectURL(blob);
                         const a = document.createElement('a');
                         a.href = url;
-                        a.download = `cbp7501_runid_${new Date().getTime()}.xlsx`;
+                        a.download = `cbp7501_runid_${new Date().getTime()}.json`;
                         document.body.appendChild(a);
                         a.click();
                         window.URL.revokeObjectURL(url);
                         document.body.removeChild(a);
                         
-                        runIdStatus.innerHTML = '✅ Success! Excel file downloaded.';
+                        runIdStatus.innerHTML = '✅ Success! JSON file downloaded.';
                         runIdInput.value = '';
                     } else {
-                        throw new Error('Failed to process data to Excel');
+                        throw new Error('Failed to process data to JSON');
                     }
                 } else {
                     runIdStatus.style.color = '#d32f2f';
@@ -2441,6 +3324,7 @@ def index():
         const processButton = document.getElementById('processButton');
         const loading = document.getElementById('loading');
         const successMessage = document.getElementById('successMessage');
+        const successDetails = document.getElementById('successDetails');
 
         ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
             uploadArea.addEventListener(eventName, (e) => {
@@ -2462,9 +3346,9 @@ def index():
         });
 
         uploadArea.addEventListener('drop', (e) => {
-            const files = e.dataTransfer.files;
+            const files = Array.from(e.dataTransfer.files);
             if (files.length > 0) {
-                handleFile(files[0]);
+                handleFiles(files);
             }
         }, false);
 
@@ -2474,16 +3358,30 @@ def index():
 
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) {
-                handleFile(e.target.files[0]);
+                handleFiles(Array.from(e.target.files));
             }
         });
 
-        function handleFile(file) {
-            selectedFile = file;
-            fileName.textContent = `📎 ${file.name}`;
-            fileSize.textContent = `Size: ${formatBytes(file.size)}`;
+        function handleFiles(files) {
+            selectedFiles = files;
+            const totalSize = files.reduce((sum, file) => sum + file.size, 0);
+            
+            if (files.length === 1) {
+                fileName.textContent = `📎 ${files[0].name}`;
+                fileSize.textContent = `Size: ${formatBytes(files[0].size)}`;
+            } else {
+                fileName.textContent = `📎 ${files.length} files selected`;
+                fileSize.textContent = `Total size: ${formatBytes(totalSize)}`;
+            }
+            
             fileInfo.classList.add('show');
             processButton.classList.add('show');
+            
+            if (files.length > 1) {
+                processButton.textContent = `Process ${files.length} PDFs (Parallel)`;
+            } else {
+                processButton.textContent = 'Extract & Generate JSON';
+            }
         }
 
         function formatBytes(bytes) {
@@ -2495,14 +3393,25 @@ def index():
         }
 
         processButton.addEventListener('click', async () => {
-            if (!selectedFile) return;
+            if (selectedFiles.length === 0) return;
 
             processButton.disabled = true;
             loading.classList.add('show');
             successMessage.classList.remove('show');
+            loading.querySelector('div').textContent = selectedFiles.length > 1 
+                ? `Processing ${selectedFiles.length} documents in parallel...` 
+                : 'Processing document...';
 
             const formData = new FormData();
-            formData.append('file', selectedFile);
+            
+            // Append files as 'files[]' for multiple or 'file' for single
+            if (selectedFiles.length === 1) {
+                formData.append('file', selectedFiles[0]);
+            } else {
+                selectedFiles.forEach(file => {
+                    formData.append('files[]', file);
+                });
+            }
 
             try {
                 const response = await fetch('/upload', {
@@ -2514,8 +3423,17 @@ def index():
                     const blob = await response.blob();
                     const url = window.URL.createObjectURL(blob);
                     const a = document.createElement('a');
+                    
+                    // Determine file extension based on content type
+                    const contentType = response.headers.get('content-type');
+                    const isZip = contentType && contentType.includes('zip');
+                    const extension = isZip ? 'zip' : 'json';
+                    const filename = selectedFiles.length > 1 
+                        ? `cbp7501_batch_${new Date().getTime()}.zip`
+                        : `cbp7501_${selectedFiles[0].name.replace(/\.[^/.]+$/, '')}_${new Date().getTime()}.json`;
+                    
                     a.href = url;
-                    a.download = `cbp7501_extracted_${new Date().getTime()}.xlsx`;
+                    a.download = filename;
                     document.body.appendChild(a);
                     a.click();
                     window.URL.revokeObjectURL(url);
@@ -2523,16 +3441,24 @@ def index():
 
                     loading.classList.remove('show');
                     successMessage.classList.add('show');
+                    successDetails.textContent = selectedFiles.length > 1
+                        ? `${selectedFiles.length} files processed. ZIP archive downloaded.`
+                        : 'JSON file downloaded successfully.';
+                    
+                    // Reset
+                    selectedFiles = [];
+                    fileInfo.classList.remove('show');
+                    processButton.classList.remove('show');
+                    fileInput.value = '';
                 } else {
                     // Try to get error message from response
-                    let errorMessage = 'Error processing file. Please try again.';
+                    let errorMessage = 'Error processing file(s). Please try again.';
                     try {
                         const errorData = await response.json();
                         if (errorData.error) {
                             errorMessage = `Error: ${errorData.error}`;
                         }
                     } catch (e) {
-                        // If response is not JSON, use default message
                         errorMessage = `Error: ${response.status} ${response.statusText}`;
                     }
                     throw new Error(errorMessage);
@@ -2540,7 +3466,7 @@ def index():
             } catch (error) {
                 console.error('Error:', error);
                 loading.classList.remove('show');
-                alert(error.message || 'Error processing file. Please try again.');
+                alert(error.message || 'Error processing file(s). Please try again.');
                 processButton.disabled = false;
             }
         });
@@ -2862,28 +3788,28 @@ def process_json_data():
         if validation_report['status'] == 'success':
             print(f"\n✅ All validation checks passed!")
         
-        # Generate Excel file
-        print(f"\n🔄 Step 3: Generating Excel file...")
+        # Generate JSON file
+        print(f"\n🔄 Step 3: Generating JSON file...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f'cbp7501_data_{timestamp}.xlsx'
+        output_filename = f'cbp7501_data_{timestamp}.json'
         output_path = os.path.join(OUTPUT_FOLDER, output_filename)
         
-        normalizer.to_excel(normalized_data, output_path)
+        normalizer.to_json(normalized_data, output_path)
         
-        print(f"   ✅ Excel generated")
+        print(f"   ✅ JSON generated")
         print(f"\n{'='*80}")
         print(f"✅ PROCESSING COMPLETE")
         print(f"{'='*80}")
-        print(f"📊 Output: {len(normalized_data)} rows × 80 columns")
+        print(f"📊 Output: {len(normalized_data)} rows")
         print(f"💾 Saved to: {output_path}")
         print(f"{'='*80}\n")
         
-        # Send Excel file
+        # Send JSON file
         return send_file(
             output_path,
             as_attachment=True,
             download_name=output_filename,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            mimetype='application/json'
         )
         
     except Exception as e:
@@ -2982,28 +3908,28 @@ def process_json():
         elif validation_report['status'] == 'warning':
             print(f"\n⚠️  Validation passed with warnings")
         
-        # Generate Excel file
-        print(f"\n🔄 Step 4: Generating Excel file...")
+        # Generate JSON file
+        print(f"\n🔄 Step 4: Generating JSON file...")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f'cbp7501_manual_{timestamp}.xlsx'
+        output_filename = f'cbp7501_manual_{timestamp}.json'
         output_path = os.path.join(OUTPUT_FOLDER, output_filename)
         
-        normalizer.to_excel(normalized_data, output_path)
+        normalizer.to_json(normalized_data, output_path)
         
-        print(f"   ✅ Excel generated")
+        print(f"   ✅ JSON generated")
         print(f"\n{'='*80}")
         print(f"✅ PROCESSING COMPLETE")
         print(f"{'='*80}")
-        print(f"📊 Output: {len(normalized_data)} rows × 80 columns")
+        print(f"📊 Output: {len(normalized_data)} rows")
         print(f"💾 Saved to: {output_path}")
         print(f"{'='*80}\n")
         
-        # Send Excel file
+        # Send JSON file
         return send_file(
             output_path,
             as_attachment=True,
             download_name=output_filename,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            mimetype='application/json'
         )
         
     except Exception as e:
@@ -3017,110 +3943,230 @@ def process_json():
         return jsonify({'error': str(e)}), 500
 
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    """Handle file upload and processing with validation"""
-    logger.info("File upload request received")
-    
-    if 'file' not in request.files:
-        logger.warning("No file provided in upload request")
-        return jsonify({'error': 'No file provided'}), 400
-    
-    file = request.files['file']
-    logger.info(f"File received: {file.filename}")
-    
-    if file.filename == '':
-        logger.warning("Empty filename in upload request")
-        return jsonify({'error': 'No file selected'}), 400
-    
-    # Save uploaded file
-    filename = file.filename
-    filepath = os.path.join(UPLOAD_FOLDER, filename)
-    logger.info(f"Saving uploaded file to: {filepath}")
-    file.save(filepath)
-    logger.info(f"File saved successfully - Size: {os.path.getsize(filepath)} bytes")
-    
+def process_single_pdf(filepath: str, filename: str) -> Dict[str, Any]:
+    """
+    Process a single PDF file and return both original and normalized data
+    Returns dict with 'success', 'filename', 'raw_a79_data', 'extracted_data', 'normalized_data', 'error' keys
+    """
     try:
-        logger.info(f"Starting PDF processing workflow for: {filename}")
-        print(f"\n{'='*80}")
-        print(f"📥 PDF PROCESSING: {filename}")
-        print(f"{'='*80}")
+        logger.info(f"Processing PDF: {filename}")
         
-        # Process document with API (or mock data)
-        print(f"\n🔄 Step 1: Extracting data from PDF...")
+        # Process document with API - returns parsed data with _raw_a79_response attached
         extracted_data = process_document_with_api(filepath, filename)
-        print(f"   ✅ Data extracted")
+        
+        # Extract raw A79 response if attached
+        raw_a79_response = extracted_data.pop('_raw_a79_response', None)
+        
+        # If not attached, try to load from debug file
+        if raw_a79_response is None:
+            debug_file = filepath.replace('.pdf', '_api1_response.json')
+            if os.path.exists(debug_file):
+                try:
+                    with open(debug_file, 'r') as f:
+                        raw_a79_response = json.load(f)
+                    logger.info(f"Loaded raw A79 response from {debug_file}")
+                except Exception as e:
+                    logger.warning(f"Could not load raw response: {e}")
+        
+        # If still no raw response, use extracted_data (which is parsed)
+        if raw_a79_response is None:
+            raw_a79_response = extracted_data
         
         # Normalize data
-        print(f"\n🔄 Step 2: Normalizing data to CBP 7501 format...")
         normalizer = CBP7501Normalizer()
         normalized_data = normalizer.normalize(extracted_data)
-        print(f"   ✅ Generated {len(normalized_data)} rows")
         
-        # Validate and compare with reference
-        print(f"\n🔄 Step 3: Validating against reference Excel structure...")
+        # Validate
         validation_report = validate_and_compare_with_reference(normalized_data)
         
-        # Print validation report
+        return {
+            'success': True,
+            'filename': filename,
+            'raw_a79_data': raw_a79_response,  # Raw A79 response with all header data
+            'extracted_data': extracted_data,  # Parsed structure
+            'normalized_data': normalized_data,  # Flattened structure for Excel-like export
+            'validation': validation_report,
+            'row_count': len(normalized_data)
+        }
+    except Exception as e:
+        logger.error(f"Error processing {filename}: {str(e)}")
+        return {
+            'success': False,
+            'filename': filename,
+            'error': str(e),
+            'data': None
+        }
+
+
+@app.route('/upload', methods=['POST'])
+def upload_file():
+    """Handle single or multiple file uploads with parallel processing"""
+    logger.info("File upload request received")
+    
+    # Check if API key is configured
+    if not API_KEY or API_KEY.strip() == '':
+        error_msg = 'A79_API_KEY environment variable is not set. Please set it before uploading files.'
+        logger.error(error_msg)
+        return jsonify({'error': error_msg}), 500
+    
+    # Handle multiple files
+    if 'files[]' in request.files:
+        files = request.files.getlist('files[]')
+    elif 'file' in request.files:
+        files = [request.files['file']]
+    else:
+        return jsonify({'error': 'No files provided'}), 400
+    
+    # Filter out empty files
+    files = [f for f in files if f.filename and f.filename.strip() != '']
+    
+    if not files:
+        return jsonify({'error': 'No valid files selected'}), 400
+    
+    logger.info(f"Received {len(files)} file(s) for processing")
+    
+    # Save all uploaded files
+    file_tasks = []
+    for file in files:
+        filename = file.filename
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
+        file_tasks.append((filepath, filename))
+        logger.info(f"Saved file: {filename} ({os.path.getsize(filepath)} bytes)")
+    
+    try:
+        # Process files in parallel using ThreadPoolExecutor
+        results = []
+        max_workers = min(len(file_tasks), 5)  # Limit to 5 concurrent API calls
+        
         print(f"\n{'='*80}")
-        print(f"📋 VALIDATION REPORT")
+        print(f"📥 PROCESSING {len(file_tasks)} PDF(S) IN PARALLEL")
         print(f"{'='*80}")
-        print(f"Status: {validation_report['status'].upper()}")
-        print(f"Total Rows: {validation_report['stats']['total_rows']}")
-        print(f"Total Columns: {validation_report['stats']['total_columns']}/80")
-        print(f"Column Match: {validation_report['stats'].get('column_match', 'N/A')}")
+        print(f"🔄 Using {max_workers} worker threads")
         
-        if validation_report['warnings']:
-            print(f"\n⚠️  WARNINGS ({len(validation_report['warnings'])}):")
-            for warning in validation_report['warnings'][:10]:
-                print(f"   • {warning}")
-            if len(validation_report['warnings']) > 10:
-                print(f"   ... and {len(validation_report['warnings']) - 10} more warnings")
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all tasks
+            future_to_file = {
+                executor.submit(process_single_pdf, filepath, filename): (filepath, filename)
+                for filepath, filename in file_tasks
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_file):
+                filepath, filename = future_to_file[future]
+                try:
+                    result = future.result()
+                    results.append(result)
+                    if result['success']:
+                        print(f"   ✅ {filename}: {result['row_count']} rows extracted")
+                    else:
+                        print(f"   ❌ {filename}: {result['error']}")
+                except Exception as e:
+                    logger.error(f"Exception processing {filename}: {str(e)}")
+                    results.append({
+                        'success': False,
+                        'filename': filename,
+                        'error': str(e),
+                        'data': None
+                    })
         
-        if validation_report['errors']:
-            print(f"\n❌ ERRORS ({len(validation_report['errors'])}):")
-            for error in validation_report['errors']:
-                print(f"   • {error}")
-        
-        if validation_report['status'] == 'success':
-            print(f"\n✅ All validation checks passed!")
-        elif validation_report['status'] == 'warning':
-            print(f"\n⚠️  Validation passed with warnings")
-        
-        # Generate Excel file
-        print(f"\n🔄 Step 4: Generating Excel file...")
+        # Generate JSON output
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_filename = f'cbp7501_extracted_{timestamp}.xlsx'
-        output_path = os.path.join(OUTPUT_FOLDER, output_filename)
         
-        normalizer.to_excel(normalized_data, output_path)
-        
-        print(f"   ✅ Excel generated")
-        print(f"\n{'='*80}")
-        print(f"✅ PROCESSING COMPLETE")
-        print(f"{'='*80}")
-        print(f"📊 Output: {len(normalized_data)} rows × 80 columns")
-        print(f"💾 Saved to: {output_path}")
-        print(f"{'='*80}\n")
-        
-        # Clean up uploaded file
-        os.remove(filepath)
-        
-        # Send Excel file
-        return send_file(
-            output_path,
-            as_attachment=True,
-            download_name=output_filename,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
+        if len(results) == 1:
+            # Single file - return JSON directly
+            result = results[0]
+            if not result['success']:
+                return jsonify({'error': result['error'], 'filename': result['filename']}), 500
+            
+            output_filename = f'cbp7501_{os.path.splitext(result["filename"])[0]}_{timestamp}.json'
+            output_path = os.path.join(OUTPUT_FOLDER, output_filename)
+            
+            normalizer = CBP7501Normalizer()
+            # Pass raw_a79_data (unparsed) to preserve all header fields exactly as A79 returns
+            normalizer.to_json(
+                result.get('normalized_data', []), 
+                output_path, 
+                extracted_data=result.get('extracted_data'),
+                raw_a79_data=result.get('raw_a79_data')
+            )
+            
+            print(f"\n{'='*80}")
+            print(f"✅ PROCESSING COMPLETE")
+            print(f"{'='*80}")
+            print(f"📊 Output: {result['row_count']} rows")
+            print(f"💾 Saved to: {output_path}")
+            print(f"{'='*80}\n")
+            
+            # Clean up uploaded file
+            if os.path.exists(file_tasks[0][0]):
+                os.remove(file_tasks[0][0])
+            
+            return send_file(
+                output_path,
+                as_attachment=True,
+                download_name=output_filename,
+                mimetype='application/json'
+            )
+        else:
+            # Multiple files - create ZIP archive with JSON files
+            zip_filename = f'cbp7501_batch_{timestamp}.zip'
+            zip_path = os.path.join(OUTPUT_FOLDER, zip_filename)
+            
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for result in results:
+                    if result['success']:
+                        json_filename = f'cbp7501_{os.path.splitext(result["filename"])[0]}.json'
+                        json_path = os.path.join(OUTPUT_FOLDER, json_filename)
+                        
+                        normalizer = CBP7501Normalizer()
+                        # Pass raw_a79_data (unparsed) to preserve all header fields exactly as A79 returns
+                        normalizer.to_json(
+                            result.get('normalized_data', []), 
+                            json_path,
+                            extracted_data=result.get('extracted_data'),
+                            raw_a79_data=result.get('raw_a79_data')
+                        )
+                        
+                        zipf.write(json_path, json_filename)
+                        os.remove(json_path)  # Clean up temp JSON file
+                    else:
+                        # Add error file to ZIP
+                        error_filename = f'ERROR_{os.path.splitext(result["filename"])[0]}.txt'
+                        error_content = f"Error processing {result['filename']}:\n{result['error']}"
+                        zipf.writestr(error_filename, error_content)
+            
+            # Clean up uploaded files
+            for filepath, _ in file_tasks:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+            
+            successful = sum(1 for r in results if r['success'])
+            total_rows = sum(r['row_count'] for r in results if r['success'])
+            
+            print(f"\n{'='*80}")
+            print(f"✅ BATCH PROCESSING COMPLETE")
+            print(f"{'='*80}")
+            print(f"📊 Processed: {successful}/{len(results)} files successfully")
+            print(f"📊 Total rows: {total_rows}")
+            print(f"💾 Saved to: {zip_path}")
+            print(f"{'='*80}\n")
+            
+            return send_file(
+                zip_path,
+                as_attachment=True,
+                download_name=zip_filename,
+                mimetype='application/zip'
+            )
         
     except Exception as e:
-        logger.error(f"Error processing file {filename}: {str(e)}")
+        error_message = str(e)
+        logger.error(f"Error processing file {filename}: {error_message}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         print(f"\n{'='*80}")
         print(f"❌ ERROR PROCESSING FILE")
         print(f"{'='*80}")
-        print(f"Error: {str(e)}")
+        print(f"Error: {error_message}")
         import traceback
         traceback.print_exc()
         print(f"{'='*80}\n")
@@ -3130,7 +4176,17 @@ def upload_file():
             logger.info(f"Cleaning up uploaded file: {filepath}")
             os.remove(filepath)
         
-        return jsonify({'error': str(e)}), 500
+        # Provide user-friendly error messages
+        if 'A79_API_KEY' in error_message or 'API key' in error_message:
+            user_message = "API key is not configured. Please set the A79_API_KEY environment variable."
+        elif 'API Error 500' in error_message:
+            user_message = "The A79 API returned an internal server error. Please try again or contact support."
+        elif 'API Error 401' in error_message:
+            user_message = "Invalid API key. Please check your A79_API_KEY environment variable."
+        else:
+            user_message = error_message
+        
+        return jsonify({'error': user_message}), 500
 
 
 if __name__ == '__main__':

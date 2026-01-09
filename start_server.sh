@@ -11,10 +11,14 @@ if lsof -ti:5002 > /dev/null 2>&1; then
     sleep 2
 fi
 
+# Set API key from A79_API_SETUP.md
+export A79_API_KEY="sk-a79-wvymMMk2FdgHPGBP9mGakuGLnc/FZg3i"
+
 # Activate virtual environment and start server
 echo "🚀 Starting Flask server..."
 echo "📂 Working directory: $(pwd)"
 echo "🐍 Python: $(./venv/bin/python --version)"
+echo "🔑 API Key: ${A79_API_KEY:0:20}... (configured)"
 echo ""
 
 # Start the server
