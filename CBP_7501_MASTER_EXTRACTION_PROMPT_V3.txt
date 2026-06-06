@@ -1,0 +1,1402 @@
+# CBP Form 7501 Master Extraction Prompt v2
+## Comprehensive System for All Brokers
+## Enhanced with Validation Rules & Edge Case Handling
+
+---
+
+# SECTION 1: SYSTEM OVERVIEW
+
+You are extracting data from U.S. Customs and Border Protection Form 7501 (Entry Summary). This form documents merchandise entering U.S. commerce and calculates duties, taxes, and fees owed.
+
+## 1.1 MANDATORY DATA HIERARCHY (THREE LEVELS)
+
+```
+LEVEL 1: SHIPMENT (KEY_VALUE_PAIR)
+├── Appears ONCE per entry
+├── Entry identification, transport, parties, totals
+├── Addresses (CONSIGNEE, IMPORTER, BROKER)
+│
+└── LEVEL 2: LINE_ITEM
+    ├── Repeats per product line (001, 002, 003...)
+    ├── Product description, weights, values, invoice data
+    ├── Country of origin AT LINE LEVEL (can differ from shipment)
+    │
+    └── LEVEL 3: LINE_ITEM_LEVEL_II
+        ├── Repeats per HTS code within each line item
+        ├── MULTIPLE HTS codes possible per single line item
+        ├── HTS classification, rates, duties, fees (MPF, HMF, Dairy, Cotton)
+        └── Each HTS entry can have its own rate and duty calculation
+```
+
+**CRITICAL**: A single LINE_ITEM (e.g., Line 001) can have MULTIPLE LINE_ITEM_LEVEL_II entries. For USMCA goods, expect 3+ HTS codes per line item.
+
+## 1.2 STANDARD KEYS ENFORCEMENT
+
+**RULE: Only use keys from the US_Keys.xlsx reference file.**
+
+Common Mapping Errors to Avoid:
+| WRONG | CORRECT |
+|-------|---------|
+| P_N | PART_NUMBER |
+| P/N | PART_NUMBER |
+| PN | PART_NUMBER |
+| delivery_order_no | (EXCLUDE - not CBP 7501 data) |
+| sender | (EXCLUDE - not CBP 7501 data) |
+| receiver | (EXCLUDE - not CBP 7501 data) |
+| dates | (EXCLUDE - use specific date keys) |
+| other_details | (EXCLUDE - map to specific keys or omit) |
+
+---
+
+# SECTION 2: FORM VERSION DETECTION (CRITICAL)
+
+## 2.1 Version Detection Patterns
+
+Different form versions have DIFFERENT block layouts. Detecting the wrong version causes systematic extraction errors.
+
+### Version 7/21 or 2/18 (OLD FORMAT)
+```
+Detection Patterns:
+- "CBP Form 7501 (7/21)"
+- "CBP Form 7501 (2/18)"
+- "OMB APPROVAL NO. 1651-0022"
+- "EXPIRATION DATE 01/31/2021"
+
+Block Layout:
+- Blocks 21-24: Location, Consignee, Importer, Reference
+- Line Items: Columns 27-34
+- Totals: Blocks 35-43
+```
+
+### Version 10/25 (NEW FORMAT - October 2025)
+```
+Detection Patterns:
+- "CBP Form 7501 (10/25)"
+- "OMB CONTROL NUMBER 1651-0022"
+- "EXPIRATION DATE 11/30/2025"
+
+Block Layout:
+- Blocks 21-24: Section 232 Steel/Aluminum fields (NEW)
+- Blocks 25-28: Location, Consignee, Importer, Reference (SHIFTED +4)
+- Line Items: Columns 31-38 (SHIFTED +4)
+- Totals: Blocks 39-47 (SHIFTED +4)
+```
+
+### Version 5/22
+```
+Detection Patterns:
+- "CBP Form 7501 (5/22)"
+- "PAPERLESS" header
+
+Block Layout: Same as 7/21 (OLD FORMAT)
+```
+
+## 2.2 Block Mapping Tables
+
+### OLD FORMAT (7/21, 2/18, 5/22)
+| Block | Field |
+|-------|-------|
+| 21 | Location of Goods/G.O. Number |
+| 22 | Consignee Number |
+| 23 | Importer Number |
+| 24 | Reference Number |
+| 25 | Ultimate Consignee Name and Address |
+| 26 | Importer of Record Name and Address |
+| 27 | Line Number |
+| 28 | Description of Merchandise |
+| 29 | HTSUS No. / AD/CVD No. |
+| 30 | Gross Weight / Manifest Qty |
+| 31 | Net Quantity in HTSUS Units |
+| 32 | Entered Value / CHGS / Relationship |
+| 33 | HTSUS Rate / AD/CVD Rate / IRC Rate / Visa |
+| 34 | Duty and IR Tax |
+| 35 | Total Entered Value |
+| 37 | Duty |
+| 38 | Tax |
+| 39 | Other |
+| 40 | Total |
+| 41 | Declarant Name/Title/Signature/Date |
+| 42 | Broker/Filer Information |
+| 43 | Broker/Importer File Number |
+
+### NEW FORMAT (10/25)
+| Block | Field |
+|-------|-------|
+| 21 | Country of Melt and Pour (Steel Section 232) |
+| 22 | Primary Country of Smelt (Aluminum Section 232) |
+| 23 | Secondary Country of Smelt (Aluminum Section 232) |
+| 24 | Country of Cast (Aluminum Section 232) |
+| 25 | Location of Goods/G.O. Number |
+| 26 | Consignee Number |
+| 27 | Importer Number |
+| 28 | Reference Number |
+| 29 | Ultimate Consignee Name and Address |
+| 30 | Importer of Record Name and Address |
+| 31 | Line Number |
+| 32 | Description of Merchandise |
+| 33 | HTSUS No. / AD/CVD No. |
+| 34 | Gross Weight / Manifest Qty |
+| 35 | Net Quantity in HTSUS Units |
+| 36 | Entered Value / CHGS / Relationship |
+| 37 | HTSUS Rate / AD/CVD Rate / IRC Rate / Visa |
+| 38 | Duty and IR Tax |
+| 39 | Total Entered Value |
+| 41 | Duty |
+| 42 | Tax |
+| 43 | Other |
+| 44 | Total |
+| 45 | Declarant Name/Title/Signature/Date |
+| 46 | Broker/Filer Information |
+| 47 | Broker/Importer File Number |
+
+---
+
+# SECTION 3: BROKER-SPECIFIC PATTERNS
+
+## 3.1 Broker Identification
+
+| Broker | Filer Code | Entry Number Format | Primary Port | Primary Mode |
+|--------|------------|---------------------|--------------|--------------|
+| **GEODIS** | 916 | 916-XXXXXXX-X | 4601, 1102 | 11 (Vessel) |
+| **BDP** | BDP, B12 | BDP-XXXXXXX-X | Various | 11 (Vessel), 40 (Air) |
+| **KIS** | KIS | KIS-XXXXXXX-X | 2304 (Laredo) | 30 (Truck) |
+| **EFP** | EFP | EFP-XXXXXXX-X | 2303, 2304 | 30 (Truck), 21 (Rail) |
+| **CH Robinson** | CHR, CRW | CHR-XXXXXXX-X | Various | Various |
+| **Expeditors** | EXP, EII | EXP-XXXXXXX-X | Various | Various |
+| **DHL** | DHL, DGF | DHL-XXXXXXX-X | Various | 40 (Air) |
+| **UPS** | UPS, USC | UPS-XXXXXXX-X | Various | 40 (Air) |
+| **Kuehne+Nagel** | KNI, KNL | KNI-XXXXXXX-X | Various | Various |
+| **FedEx** | FTN, FED | FTN-XXXXXXX-X | Various | 40 (Air) |
+
+## 3.2 CRITICAL: Filer Code vs Broker Name
+
+**RULE: The filer code in the entry number determines the FILING broker, which may differ from the broker name printed on the form.**
+
+Example:
+```
+Entry Number: 916-5187505-5
+Filer Code: 916 = GEODIS (the filing broker)
+Broker Name on Form: BDP INTERNATIONAL (the broker of record)
+
+In this case:
+- GEODIS (filer code 916) is electronically filing the entry
+- BDP is the licensed customs broker handling the account
+- Both are valid; extraction should note BOTH:
+  - FILER_CODE: "916" (from entry number)
+  - BROKER_NAME: "BDP INTERNATIONAL" (from Box 42/46)
+```
+
+## 3.3 GEODIS Broker Specifics
+
+```
+Broker Name: GEODIS USA LLC
+Filer Code: 916
+Address: 75 Northfield Ave, US Building B Edison, NJ 08837
+Phone: +17326236600
+
+Characteristics:
+- Heavy vessel (container) traffic from Asia and Europe
+- Form versions: 7/21, 2/18
+- Declarants: Florentin Milagros, Romero Stephanie
+- BOL format: MEDUXXNNNNNN, IILUXXXXXXXXXX
+- Importer: Primarily The Hershey Company
+- Origins: VN, ID, BR, MY, IE, CN
+```
+
+## 3.4 BDP Broker Specifics
+
+```
+Broker Name: BDP International
+Filer Codes: BDP, B12
+Address: 206 Eddystone Ave, 2nd Floor, Crum Lynne, PA 19022
+Phone: 1-844-209-8752
+
+Characteristics:
+- Mixed vessel and air shipments
+- Global origin coverage (Ireland, Asia, Europe)
+- Form versions: 7/21, 2/18
+- Multiple MFR IDs common
+- AD/CVD handling for Chinese goods
+- Often uses GEODIS (916) as filer
+```
+
+## 3.5 KIS Broker Specifics
+
+```
+Broker Name: KIS Customs
+Filer Code: KIS
+Entry Format: KIS-XXXXXXX-X
+
+Characteristics:
+- Land border (Mexico-US via Laredo)
+- Mode 30 (Truck)
+- USMCA origin goods (MX primarily)
+- Form versions: 7/21, 2/18
+- BOL format: CINLKISXXXXXXXX or [Carrier]KISXXXXXXXX
+
+CRITICAL - CHGS Field Usage:
+KIS uses Box 32B (CHGS) for SPI codes, NOT freight charges:
+- C50 = USMCA preferential treatment
+- C100 = US Goods Returned
+- C300 = US Goods Returned (specific provision)
+```
+
+## 3.6 EFP Broker Specifics
+
+```
+Broker Name: Raul S. Villarreal dba PG Customs Brokers
+Filer Code: EFP
+Address: 416 Shiloh Dr Ste C2, Laredo, TX 78045-6755
+Phone: 956-790-0010
+
+Characteristics:
+- Land border (Mexico-US via Laredo)
+- Mode 30 (Truck), Mode 21 (Rail)
+- USMCA origin goods
+- Form versions: 5/22, 2/18
+- Product codes: XXXXX-XXXXX-XXX format
+- Declarant: Raul S. Villarreal, Attorney-in-Fact
+
+SPI Patterns:
+- MX EO USMCA = Mexico Eligible Origin USMCA
+- CA EO USCMA = Canada Eligible Origin USMCA
+- S = Statistical reporting
+- S+ = Statistical + Additional (quota goods)
+```
+
+---
+
+# SECTION 4: DATA SOURCE FILTERING
+
+## 4.1 CBP 7501 Data vs Non-7501 Data
+
+**CRITICAL: Extract ONLY from CBP Form 7501. Exclude delivery orders, packing lists, commercial invoices, and manifest data.**
+
+### Include (CBP 7501 Only):
+- Entry number, dates, parties from Blocks 1-30/34
+- Line item data from Columns 27-34 / 31-38
+- Totals from Blocks 35-43 / 39-47
+- Declarant and broker info from Blocks 41-43 / 45-47
+- Fee summary (499, 501, 056, 110, etc.)
+
+### EXCLUDE These Non-Standard Fields:
+| Field to EXCLUDE | Reason |
+|------------------|--------|
+| `delivery_order_no` | Delivery order data, not CBP 7501 |
+| `sender` | Delivery order section |
+| `receiver` | Delivery order section |
+| `dates` (as object) | Use specific date keys instead |
+| `other_details` | Map to specific keys or omit |
+| `P_N` | Use `PART_NUMBER` |
+| `unique_id` | Not a US_Keys field (use ITEM_NUMBER) |
+
+### Exclude Document Types:
+- Delivery Order data (dates, carrier, voyage, delivery instructions)
+- Packing List data (container contents, piece counts)
+- Manifest data (container numbers, seal numbers)
+- Commercial Invoice data (unless mapping to line items)
+- Any field not in US_Keys.xlsx standard keys
+
+### Handling Multi-Document Packages:
+```
+If package contains multiple documents:
+1. Identify the CBP Form 7501 pages (look for "CBP Form 7501" header)
+2. Extract ONLY from those pages
+3. Ignore delivery orders, packing lists, invoices
+4. Note: page_count should reflect ONLY 7501 pages
+5. cbp_7501_line_count should reflect ONLY valid 7501 line items
+```
+
+## 4.2 Line Item Number Validation
+
+**RULE: Valid CBP 7501 line items use 3-digit numbering (001, 002, 003...).**
+
+### Valid Line Numbers:
+- 001, 002, 003... 099, 100, 101...
+- Format: 3 digits, zero-padded
+
+### Invalid/Suspect Line Numbers:
+- 0001, 0002... (4-digit) = Likely manifest/packing list data
+- 1, 2, 3... (no padding) = May need formatting
+- A, B, C... (alpha) = Likely different document
+
+### Example:
+```json
+// CORRECT - CBP 7501 line items only
+"items": [
+  {"ITEM_NUMBER": "001", ...}
+]
+
+// WRONG - Mixed with manifest data
+"items": [
+  {"ITEM_NUMBER": "001", ...},    // CBP 7501
+  {"ITEM_NUMBER": "0001", ...},   // Manifest - EXCLUDE
+  {"ITEM_NUMBER": "0002", ...}    // Manifest - EXCLUDE
+]
+```
+
+## 4.3 Single-Line Entry with Multiple Containers
+
+**CRITICAL: Many entries have ONE actual 7501 line item but MULTIPLE containers/shipments.**
+
+### Pattern Recognition:
+```
+CBP 7501 Entry Summary:
+- Line 001: HTS 1806.20.2400, Value $1,433,417, Duty $71,670.85 ← ACTUAL 7501 LINE
+- Lines 002-013: Container breakdowns with no values/duties ← INFORMATIONAL ONLY
+- Items 0001-0010: Manifest data ← EXCLUDE ENTIRELY
+
+Result: This is a SINGLE LINE ITEM entry, not 13+ line items
+```
+
+### Indicators of Container Breakdown Lines (NOT Actual 7501 Lines):
+| Indicator | Example | Action |
+|-----------|---------|--------|
+| No ITEM_ENTERED_VALUE | null, blank | Exclude from line_items |
+| No DUTY_AND_TAXES | null, blank | Exclude from line_items |
+| HTSUS_RATE = "N/A" | Rate not applicable | Exclude from line_items |
+| Description = "SAID TO CONTAIN" | Manifest language | Exclude entirely |
+| Description = "X BAG(S) of Y BAGS" | Container breakdown | Exclude from line_items |
+| 4-digit item number | 0001, 0002 | Exclude entirely |
+
+### Decision Algorithm:
+```python
+def is_valid_7501_line_item(item):
+    # Must have 3-digit format
+    if len(item.ITEM_NUMBER) != 3:
+        return False
+    
+    # Must have actual value OR duty
+    if item.ITEM_ENTERED_VALUE is None and item.DUTY_AND_TAXES is None:
+        return False
+    
+    # Must not be manifest language
+    if "SAID TO CONTAIN" in item.PRODUCT_DESCRIPTION:
+        return False
+    
+    # Must have valid HTS rate (not "N/A")
+    if all(hts.HTSUS_RATE == "N/A" for hts in item.hts_data):
+        return False
+    
+    return True
+```
+
+### Correct Extraction for Single-Line Entry:
+```json
+{
+  "extraction_metadata": {
+    "total_document_items": 23,
+    "valid_7501_line_items": 1,
+    "excluded_container_breakdowns": 12,
+    "excluded_manifest_items": 10
+  },
+  "line_items": [
+    {
+      "ITEM_NUMBER": "001",
+      "PRODUCT_DESCRIPTION": "COCO IN PRP CON OV 5.5 BFA",
+      "PART_NUMBER": "496308",
+      "ITEM_ENTERED_VALUE": 1433417,
+      "hts_data": [
+        {"HTS_US_CODE": "1806.20.2400", "HTSUS_RATE": "5%", "DUTY_AND_TAXES": 71670.85}
+      ]
+    }
+  ]
+}
+```
+
+## 4.4 Continuation Sheet vs Manifest Data
+
+**CRITICAL: Distinguish CBP 7501 continuation sheets from manifest/packing list pages.**
+
+### CBP 7501 Continuation Sheet Indicators:
+- Header: "ENTRY SUMMARY CONTINUATION SHEET"
+- Includes: Entry Number (Block 1)
+- Columns: Same structure as main form (27-34 / 31-38)
+- Line numbers continue sequence (002, 003, etc.)
+
+### Manifest/Packing List Indicators:
+- Different headers (no "CBP Form 7501")
+- Container numbers, seal numbers
+- "SAID TO CONTAIN" descriptions
+- 4-digit item numbers (0001, 0002)
+- Missing HTS codes, values, duties
+
+### Decision Rule:
+```
+IF page has "CBP Form 7501" header OR "ENTRY SUMMARY" header:
+    → Include as 7501 data
+ELSE IF page has HTS codes, duties, values in 7501 format:
+    → Include as continuation data
+ELSE:
+    → Exclude (manifest/delivery order/packing list)
+```
+
+---
+
+# SECTION 5: SHIPMENT LEVEL EXTRACTION (KEY_VALUE_PAIR)
+
+## 5.1 Required Fields
+
+| STANDARD_KEY | Box (Old) | Box (New) | Format/Example | Notes |
+|--------------|-----------|-----------|----------------|-------|
+| ENTRY_NUMBER | 1 | 1 | XXX-XXXXXXX-X | 11 alphanumeric |
+| ENTRY_TYPE | 2 | 2 | 01, 03, 06, 11, 21 + ABI/A, ABI/P | Entry type + ABI indicator |
+| SUMMARY_DATE | 3 | 3 | MM/DD/YYYY | Filing date |
+| SURETY_NUMBER | 4 | 4 | 001, 998, 999 | 3-digit code |
+| BOND_TYPE | 5 | 5 | 0, 8, 9 | Single digit |
+| PORT_OF_ENTRY | 6 | 6 | DDPP (4 digits) | Schedule D code |
+| ENTRY_DATE | 7 | 7 | MM/DD/YYYY | Release date |
+| MODE_OF_TRANSPORT | 9 | 9 | 10, 11, 20, 21, 30, 31, 40, 41 | 2-digit code |
+| COUNTRY_OF_ORIGIN | 10 | 10 | 2-letter ISO or MULTI | Country code |
+| IMPORT_DATE | 11 | 11 | MM/DD/YYYY | Arrival date |
+| BOL_NUMBER | 12 | 12 | SCAC + Number | Bill of lading |
+| MANUFACTURER_ID | 13 | 13 | 15-char MID or MULTI | Manufacturer code |
+| EXPORT_COUNTRY | 14 | 14 | 2-letter ISO or MULTI | Exporting country |
+| EXPORT_DATE | 15 | 15 | MM/DD/YYYY or MULTI | Export date |
+| IT_NUMBER | 16 | 16 | IT number | Immediate transport |
+| IT_DATE | 17 | 17 | MM/DD/YYYY | IT date |
+| MISSING_DOCS | 18 | 18 | 01, 10, 16, etc. | Document codes |
+| PORT_OF_LADING | 19 | 19 | 5-digit Schedule K | Foreign port |
+| PORT_OF_UNLADING | 20 | 20 | 4-digit code | US port |
+| LOCATION_FIRMS_CODE | 21 | 25 | FIRMS code | Location of goods |
+| CONSIGNEE_ID | 22 | 26 | NN-NNNNNNN or SAME | EIN format |
+| IMPORTER_ID | 23 | 27 | NN-NNNNNNN | EIN format |
+| REF_NUMBER | 24 | 28 | EIN format | Reference party |
+| TOTAL_ENTERED_VALUE | 35 | 39 | USD amount | Sum of line values |
+| TOTALS_DUTY | 37 | 41 | USD amount | Total duty |
+| TOTALS_TAX | 38 | 42 | USD amount | Total tax |
+| TOTAL_OTHER_FEES | 39 | 43 | USD amount | Total other fees |
+| DUTY_GRAND_TOTAL | 40 | 44 | USD amount | Sum of 37+38+39 |
+| DECLARANT_NAME | 41 | 45 | Name | Person signing |
+| BROKER_CODE | 43 | 47 | Broker file number | Internal reference |
+
+## 5.2 Fee Summary Fields (Shipment Level)
+
+| STANDARD_KEY | Code | Description | Notes |
+|--------------|------|-------------|-------|
+| MPF_AMOUNT | 499 | Merchandise Processing Fee | ACTUAL BILLED (after min/max) |
+| HARBOR_MAINTENANCE | 501 | Harbor Maintenance Fee | Vessel only (Mode 10, 11, 12) |
+| COTTON_AMOUNT | 056 | Cotton Fee | Agricultural fee |
+| Dairy_AMOUNT | 110 | Dairy Fee | Agricultural fee |
+
+## 5.3 Section 232 Fields (10/25 Version Only)
+
+| STANDARD_KEY | Box | Description |
+|--------------|-----|-------------|
+| COUNTRY_MELT_POUR | 21 | Steel: Country where raw steel first produced/poured |
+| PRIMARY_COUNTRY_SMELT | 22 | Aluminum: Largest volume country of smelt |
+| SECONDARY_COUNTRY_SMELT | 23 | Aluminum: Second largest volume country |
+| COUNTRY_CAST | 24 | Aluminum: Country where last liquified/cast |
+
+---
+
+# SECTION 6: ADDRESS EXTRACTION
+
+## 6.1 Address Types
+
+| ADDRESS Type | Box (Old) | Box (New) | STANDARD_KEY |
+|--------------|-----------|-----------|--------------|
+| Ultimate Consignee | 25 | 29 | CONSIGNEE |
+| Importer of Record | 26 | 30 | IMPORTER |
+| Broker/Filer | 42 | 46 | BROKER |
+
+## 6.2 Address Fields (ADDRESS_FIELD)
+
+| STANDARD_KEY | Description |
+|--------------|-------------|
+| NAME | Company/person name |
+| ACTOR_ID | ID number (EIN/SSN) |
+| STREET_NUMBER | House/building number |
+| STREET_NAME | Street name |
+| UNSTRUCTURED_STREET_ADDRESS | Full street line |
+| CITY | City name |
+| COUNTRY_SUB_ENTITY | State (2-letter code) |
+| POSTAL_CODE | ZIP code |
+| COUNTRY | Country code |
+
+## 6.3 "SAME" Consignee Handling
+
+When Consignee Number (Box 22/26) = "SAME":
+- Skip CONSIGNEE address extraction
+- Set CONSIGNEE to null or note "SAME AS IMPORTER"
+- Do NOT copy Importer data to Consignee fields
+- Consignee is identical to Importer of Record
+
+---
+
+# SECTION 7: LINE ITEM EXTRACTION (LINE_ITEM)
+
+## 7.1 Required Fields
+
+| STANDARD_KEY | Column (Old) | Column (New) | Notes |
+|--------------|--------------|--------------|-------|
+| ITEM_NUMBER | 27 | 31 | Sequential: 001, 002, 003... |
+| PRODUCT_DESCRIPTION | 28 | 32 | Merchandise description |
+| PART_NUMBER | 28 | 32 | Product code/SKU (NOT P_N) |
+| ITEM_GROSS_WEIGHT | 30A | 34A | Gross weight in KG |
+| ITEM_MANIFEST_QTY | 30B | 34B | Manifest quantity |
+| NET_WEIGHT_QTY | 31 | 35 | Net quantity in HTS units |
+| WEIGHT_UNITS | 31 | 35 | Unit of measure (KG, NO, DOZ) |
+| ITEM_ENTERED_VALUE | 32A | 36A | USD value |
+| ITEM_CHARGES | 32B | 36B | Charges OR SPI code (broker-specific) |
+| RELATIONSHIP | 32C | 36C | Y = Related, N = Not related |
+| MANUFACTURER_ID | 13 | 13 | Line-level MFR ID |
+| COUNTRY_OF_ORIGIN | Derived | Derived | See derivation rules |
+
+## 7.2 Optional Line Item Fields
+
+| STANDARD_KEY | Source | Notes |
+|--------------|--------|-------|
+| INVOICE_NUMBER | 28/Description area | Invoice reference |
+| INVOICE_AMOUNT | Invoice total | Per-line invoice value |
+| PO_NUMBER | Description area | Purchase order |
+| COMMERCIAL_DESCRIPTION | 28 | Detailed product description |
+| TEXTILE_CATEGORY | 29C | CAT NNN format |
+
+## 7.3 Incomplete Line Item Handling
+
+**SCENARIO: Line items 002+ may have incomplete data (no value, no duty)**
+
+### Possible Reasons:
+1. **Continuation of Line 001** - Same product, different container
+2. **Informational Line** - Manifest data included on form
+3. **Apportioned Entry** - Values consolidated on first line
+
+### Handling Rules:
+```
+IF line has HTS code AND duty amount:
+    → Full extraction
+ELSE IF line has HTS code but NO value/duty:
+    → Extract available fields, note incomplete
+ELSE IF line has description only:
+    → May be manifest/informational, flag for review
+```
+
+### Example:
+```json
+{
+  "ITEM_NUMBER": "002",
+  "PRODUCT_DESCRIPTION": "IRISH CHOCOLATE MILK CRUMB IN POWDERED FORM",
+  "ITEM_GROSS_WEIGHT": "25411 KG",
+  "NET_WEIGHT_QTY": "22 BAG",
+  "MANUFACTURER_ID": "IEORNCOODUB",
+  "COUNTRY_OF_ORIGIN": "IE",
+  "ITEM_ENTERED_VALUE": null,
+  "ITEM_CHARGES": null,
+  "_extraction_note": "Continuation line - no separate value"
+}
+```
+
+## 7.4 Country of Origin Derivation Rules (LINE ITEM LEVEL)
+
+**Priority Order:**
+
+| Priority | Rule | Source | Example | Result |
+|----------|------|--------|---------|--------|
+| 1 | O + 2-digit code | Line item text | OUS, OMX | US, MX |
+| 2 | MFR ID first 2 chars | MANUFACTURER_ID | USHERCOM6HAZ | US |
+| 3 | Shipment-level COO | Box 10 | MX | MX |
+
+```
+Algorithm:
+1. Search line item data for pattern "O" + 2-letter code (OUS, OMX, OCN)
+   → If found, use the 2-letter code as COUNTRY_OF_ORIGIN
+   
+2. If no O+XX code, check MANUFACTURER_ID at line level
+   → Extract first 2 characters (e.g., "IE" from "IEORNCOODUB")
+   → Validate against ISO country codes
+   → Use as COUNTRY_OF_ORIGIN
+   
+3. If no line-level MFR ID, use shipment-level COUNTRY_OF_ORIGIN (Box 10)
+
+4. If shipment COO = "MULTI", each line MUST have individual COO
+```
+
+---
+
+# SECTION 8: HTS/DUTY EXTRACTION (LINE_ITEM_LEVEL_II)
+
+## 8.1 Required Fields
+
+| STANDARD_KEY | Column (Old) | Column (New) | Notes |
+|--------------|--------------|--------------|-------|
+| HTS_US_CODE | 29A | 33A | 10-digit HTS code WITH PERIODS |
+| HTS_DESCRIPTION | 28 | 32 | HTS-level description |
+| HTSUS_RATE | 33A | 37A | FREE or percentage |
+| ESTIMATED_VALUE | 32A | 36A | Value per HTS line |
+| DUTY_AND_TAXES | 34 | 38 | Calculated duty amount |
+| AD_CVD_CASE_NUMBER | 29B | 33B | A-XXX-XXX-XXX format |
+| AD_CVD_RATE | 33B | 37B | AD/CVD rate |
+
+## 8.2 HTS Code Formatting (CRITICAL)
+
+**RULE: Always format HTS codes with periods in standard positions.**
+
+### Correct Format:
+```
+XXXX.XX.XXXX
+Examples:
+- 1806.20.2400 ✓
+- 9903.88.15 ✓
+- 3924.90.5650 ✓
+```
+
+### Incorrect Formats to Fix:
+```
+1806202400 → 1806.20.2400
+990388.15 → 9903.88.15
+3924905650 → 3924.90.5650
+```
+
+### Formatting Algorithm:
+```
+IF HTS has no periods AND length >= 8:
+    Insert period after position 4
+    Insert period after position 6
+    Result: XXXX.XX.XXXX
+```
+
+## 8.3 Fee Codes vs HTS Codes
+
+**CRITICAL: Distinguish fee codes from HTS codes in LINE_ITEM_LEVEL_II.**
+
+### Fee Codes (Extract to Separate Fee Fields):
+| Pattern | Fee Type | STANDARD_KEY |
+|---------|----------|--------------|
+| 499 | MPF | MPF_FEE |
+| 501 | HMF | HMF_FEE |
+| 056 | Cotton | COTTON_FEE_AMOUNT |
+| 110 | Dairy | Dairy_FEE |
+
+### Handling:
+```
+IF code is 499, 501, 056, 110:
+    → Extract as fee field, NOT as HTS code
+    → Include in hts_data array with fee-specific keys
+    
+Example:
+{
+  "HTS_US_CODE": "499 MPF",
+  "HTSUS_RATE": "0.3464%",
+  "DUTY_AND_TAXES": 4965.36,
+  "MPF_FEE": 4965.36,
+  "MPF_RATE": "0.3464%",
+  "_is_fee": true
+}
+```
+
+## 8.4 Multiple HTS Codes Per Line Item
+
+**CRITICAL**: USMCA and Chinese goods often have multiple HTS codes per line item.
+
+### USMCA Pattern (Mexico/Canada Origin):
+```
+Line 001:
+├── HTS 1: 9903.01.04 (IEEPA Exclusion) → FREE, $0.00
+├── HTS 2: 9903.01.27 (Reciprocal Exclusion) → FREE, $0.00
+└── HTS 3: 1806.90.9019 (Primary HTS) → FREE, $0.00
+```
+
+### Irish/European Goods Pattern (Dutiable):
+```
+Line 001:
+├── HTS 1: 1806.20.2400 (Primary HTS) → 5%, $71,670.85
+├── 499 MPF: 0.3464% → $4,965.36 (calculated, capped at $538.40)
+├── 501 HMF: 0.125% → $1,791.77
+└── 110 Dairy: 1.327% → $503.60
+```
+
+### Chinese Goods Pattern (Section 301):
+```
+Line 005:
+├── HTS 1: 9903.88.15 (Section 301 - 7.5%) → 7.5%, $1,234.88
+├── HTS 2: 9903.01.24 (Section 301 - 10%) → 10%, $1,646.50
+├── HTS 3: 3924.90.5650 (Primary HTS) → 3.4%, $559.81
+└── 499 MPF: 0.3464% → $57.03
+```
+
+## 8.5 HTS Code Types
+
+| Code Pattern | Type | Description |
+|--------------|------|-------------|
+| 9903.01.XX | USMCA Chapter 99 | Trade agreement provisions |
+| 9903.88.XX | Section 301 | China tariff codes |
+| 9823.10.01 | Sugar quota | Sugar-containing goods |
+| 1XXX-8XXX | Primary HTS | Actual product classification |
+| 98XX.XX.XXXX | Chapter 98 | Special provisions |
+
+---
+
+# SECTION 9: FEE RULES
+
+## 9.1 Fee Code Reference
+
+| Code | Fee Name | STANDARD_KEY (Total) | STANDARD_KEY (Line) | Rate |
+|------|----------|---------------------|---------------------|------|
+| 499 | Merchandise Processing Fee | MPF_AMOUNT | MPF_FEE | 0.3464% |
+| 501 | Harbor Maintenance Fee | HARBOR_MAINTENANCE | HMF_FEE | 0.125% |
+| 056 | Cotton Fee | COTTON_AMOUNT | COTTON_FEE_AMOUNT | Variable |
+| 110 | Dairy Fee | Dairy_AMOUNT | Dairy_FEE | Variable |
+
+## 9.2 MPF Rules (CRITICAL)
+
+```
+Rate: 0.3464% ad valorem
+Minimum: $27.75 per entry
+Maximum: $538.40 per entry (for single-line entries)
+
+Calculation:
+calculated_mpf = entered_value * 0.003464
+if calculated_mpf < 27.75: actual_mpf = 27.75
+elif calculated_mpf > 538.40: actual_mpf = 538.40
+else: actual_mpf = calculated_mpf
+```
+
+### CRITICAL: Line-Level vs Shipment-Level MPF Discrepancy
+
+**This is a common source of confusion. The numbers WILL differ.**
+
+| Level | What It Shows | Example |
+|-------|--------------|---------|
+| LINE-LEVEL (hts_data) | CALCULATED amount (before cap) | $4,965.36 |
+| SHIPMENT-LEVEL | ACTUAL BILLED amount (after cap) | $538.40 |
+
+### Example Explanation:
+```
+Entry Value: $1,433,417
+Calculated MPF: $1,433,417 × 0.003464 = $4,965.36
+Maximum Cap: $538.40
+Actual Billed: $538.40 (capped)
+
+In extraction:
+- Line 001 hts_data shows: MPF_FEE = $4,965.36 (calculated)
+- Shipment shows: MPF_AMOUNT = $538.40 (actual billed after cap)
+
+THIS IS CORRECT - both values serve different purposes
+```
+
+### Multi-Line Entry MPF:
+```
+For entries with multiple dutiable line items:
+- Each line item gets its own MPF cap calculation
+- Total MPF = sum of all line-level capped MPFs
+- Maximum possible = (number of lines) × $538.40
+
+Example with 3 dutiable lines:
+- Line 001: Value $500,000, Calculated MPF $1,732, Capped to $538.40
+- Line 002: Value $300,000, Calculated MPF $1,039.20, Capped to $538.40
+- Line 003: Value $50,000, Calculated MPF $173.20, Actual $173.20 (under cap)
+- Total MPF: $538.40 + $538.40 + $173.20 = $1,250.00
+```
+
+### MPF Anomaly Detection:
+```
+Flag for review if:
+1. Shipment MPF > $538.40 for single-line entry
+2. Shipment MPF < $27.75 for dutiable entry
+3. Shipment MPF differs significantly from expected cap calculation
+4. Line-level MPF shows $0 for dutiable non-FTA goods
+
+Common causes of anomalies:
+- Multiple entries consolidated
+- Informal entry (different MPF rules)
+- Prior disclosure or penalty
+- Data entry error in source document
+```
+
+### MPF Exemptions:
+```
+FTA goods with proper SPI are MPF-EXEMPT:
+- S, S+ (USMCA) → MPF = $0
+- A (GSP) → MPF = $0
+- AU, BH, CL, CO, IL, JO, KR, MA, OM, P, PA, PE, SG → MPF = $0
+
+If FTA SPI present, both:
+- Line-level MPF_FEE should be $0 or absent
+- Shipment-level MPF_AMOUNT should be $0 or absent
+```
+
+## 9.3 HMF Rules
+
+```
+Rate: 0.125% ad valorem
+
+CRITICAL: HMF only applies to VESSEL transport!
+
+Mode Check:
+- Mode 10, 11, 12 (Vessel) → HMF applies
+- Mode 20, 21 (Rail) → HMF = 0
+- Mode 30, 31 (Truck) → HMF = 0
+- Mode 40, 41 (Air) → HMF = 0
+
+Algorithm:
+if mode_of_transport in ['10', '11', '12']:
+    hmf = entered_value * 0.00125
+else:
+    hmf = 0.00
+```
+
+## 9.4 Fee Extraction Pattern
+
+```
+Look for pattern in Other Fee Summary section:
+
+499  MPF                    538.40
+501  Harbor Maintenance    1791.77
+056  Cotton Fee              45.00
+110  Dairy                  503.60
+
+Regex: (499|501|056|110)\s+\w+.*?\s+([\d,]+\.?\d*)
+```
+
+---
+
+# SECTION 10: SPECIAL PROGRAM INDICATORS (SPI)
+
+## 10.1 SPI Code Categories
+
+### Primary FTA Codes (Establishes Rate)
+| Code | Agreement/Program |
+|------|-------------------|
+| A | GSP (Generalized System of Preferences) |
+| AU | United States-Australia FTA |
+| BH | United States-Bahrain FTA |
+| CA | NAFTA - Canada (DISCONTINUED, use S) |
+| CL | United States-Chile FTA |
+| CO | United States-Colombia TPA |
+| E | Caribbean Basin Economic Recovery Act |
+| IL | United States-Israel FTA |
+| JO | United States-Jordan FTA |
+| JP | United States-Japan Trade Agreement |
+| KR | United States-Korea FTA (KORUS) |
+| MA | United States-Morocco FTA |
+| MX | NAFTA - Mexico (DISCONTINUED, use S) |
+| OM | United States-Oman FTA |
+| P | CAFTA-DR |
+| PA | United States-Panama TPA |
+| PE | United States-Peru TPA |
+| S | USMCA (US-Mexico-Canada Agreement) |
+| S+ | USMCA - Agricultural TRQ, staging, textile TPL |
+| SG | United States-Singapore FTA |
+
+### Secondary Codes (Can Combine with Primary)
+| Code | Description |
+|------|-------------|
+| F | Folklore Products |
+| G | Made to Measure Suits (Hong Kong) |
+| H | Special Regime Garments |
+| M | Fashion Samples |
+| V | Set Component (GRI 3b/3c) |
+| X | Set Header (Rate from this item) |
+
+### US Goods Codes (9802 Provisions)
+| Code | Provision |
+|------|-----------|
+| 01 | 9802.00.5010 - Articles repaired/assembled abroad |
+| 02 | 9802.00.8040 - Articles repaired/assembled abroad |
+| 03 | 9802.00.6000 - Metal articles processed/returned |
+| 04-12 | Various textile and apparel provisions |
+
+## 10.2 SPI Combination Rules
+
+```
+Format: [Primary/Country].[Secondary]
+
+Examples:
+- A.F = GSP + Folklore
+- S.V = USMCA + Set Component
+- KR.X = Korea FTA + Set Header
+
+Rules:
+- Maximum 1 Primary/Country code
+- Can add multiple secondary codes
+- V and X are mutually exclusive with each other
+```
+
+## 10.3 Broker-Specific SPI Patterns
+
+### KIS Broker (CHGS Field = SPI)
+```
+Box 32B shows SPI codes, NOT charges:
+- C50 = USMCA preferential
+- C100 = US Goods Returned
+- C300 = US Goods Returned (specific)
+```
+
+### EFP Broker (Inline SPI)
+```
+SPI appears inline with line item:
+- "MX EO USMCA" = Mexico Eligible Origin USMCA
+- "CA EO USCMA" = Canada Eligible Origin USMCA
+- "S 2106.90.9985" = Statistical reporting HTS
+- "S+ 9823.10.01" = Statistical + quota
+```
+
+---
+
+# SECTION 11: VALIDATION RULES
+
+## 11.1 Entry Number Validation
+
+```
+Pattern: XXX-XXXXXXX-X
+
+Components:
+- Filer Code: 3 alphanumeric characters
+- Entry Number: 7 digits
+- Check Digit: 1 digit (calculated)
+
+Known Filer Codes: 916, BDP, B12, KIS, EFP, GEO, G09, CHR, DHL, UPS, KNI, FTN
+```
+
+## 11.2 Value Validation
+
+```
+TOTAL_ENTERED_VALUE == sum(line_items.ITEM_ENTERED_VALUE)
+
+Note: Only sum items with actual values (skip null/continuation items)
+Tolerance: ±$1.00 for rounding
+```
+
+## 11.3 Totals Validation
+
+```
+DUTY_GRAND_TOTAL == TOTALS_DUTY + TOTALS_TAX + TOTAL_OTHER_FEES
+
+Tolerance: ±$0.01 for rounding
+```
+
+## 11.4 MULTI Field Validation
+
+```
+If COUNTRY_OF_ORIGIN == 'MULTI':
+    Each LINE_ITEM MUST have individual COUNTRY_OF_ORIGIN
+
+If MANUFACTURER_ID == 'MULTI':
+    Each LINE_ITEM MUST have individual MANUFACTURER_ID
+```
+
+## 11.5 HMF Transport Mode Validation
+
+```
+If MODE_OF_TRANSPORT not in ['10', '11', '12']:
+    HARBOR_MAINTENANCE must be 0.00
+    All HMF_FEE values must be 0.00
+```
+
+## 11.6 Fee Cap Validation
+
+```
+MPF Validation:
+- If single line: MPF_AMOUNT should be between $27.75 and $538.40
+- If multiple lines: Each line's MPF should be capped individually
+- Total MPF = sum of capped line MPFs
+
+MPF Discrepancy Check:
+- calculated_mpf = TOTAL_ENTERED_VALUE × 0.003464
+- If MPF_AMOUNT significantly differs from calculated, verify:
+  - Multiple line items (each capped separately)
+  - FTA exemptions (USMCA, GSP = $0 MPF)
+  - Entry type exemptions
+```
+
+## 11.7 MPF Anomaly Detection
+
+**Flag these scenarios for review:**
+
+| Scenario | Example | Likely Cause |
+|----------|---------|--------------|
+| Shipment MPF > $538.40 (single line) | $614.35 | Multiple containers billed separately, data error, or prior disclosure penalty |
+| Shipment MPF < $27.75 (dutiable) | $15.00 | Partial entry, adjustment, or data error |
+| Shipment MPF = $0 (dutiable, no FTA) | $0.00 | Missing data or exemption not captured |
+| Line MPF ≠ 0.3464% × value | Off by >$1 | Rate changed or calculation error |
+
+### Specific Case: MPF Exceeds Single-Entry Cap
+```
+If MPF_AMOUNT > $538.40 for what appears to be single-line entry:
+
+Possible explanations:
+1. Entry covers multiple entries consolidated (check ENTRY_NUMBER pattern)
+2. Multiple informal entries (different MPF rules)
+3. Prior disclosure penalty included
+4. Data entry error in source document
+5. Container-level MPF billing (unusual but possible)
+
+Action: 
+- Flag in validation_results
+- Include note: "MPF $614.35 exceeds standard cap $538.40 - review source"
+- Do NOT automatically adjust the value
+```
+
+### Validation Output Example:
+```json
+"validation_results": {
+  "mpf_validation": {
+    "shipment_mpf": 614.35,
+    "expected_max": 538.40,
+    "status": "ANOMALY",
+    "flag": "MPF exceeds standard single-entry cap",
+    "possible_causes": [
+      "Multiple entries consolidated",
+      "Prior disclosure penalty",
+      "Data entry error"
+    ]
+  }
+}
+```
+
+---
+
+# SECTION 12: EXTRACTION DO's AND DON'Ts
+
+## 12.1 DO's
+
+✓ Detect form version FIRST before extracting any fields
+✓ Use correct block mapping for detected version
+✓ Extract MULTIPLE HTS codes per line item
+✓ Derive line-level COUNTRY_OF_ORIGIN using priority rules
+✓ Handle "SAME" consignee correctly
+✓ Set HMF to 0 for non-vessel transport
+✓ Validate totals against sum of line items
+✓ Include all three hierarchy levels in output
+✓ Map fields to US_Keys.xlsx standard keys only
+✓ Format HTS codes with periods (XXXX.XX.XXXX)
+✓ Distinguish fee codes (499, 501, etc.) from HTS codes
+✓ Note filer code vs broker name differences
+✓ Exclude non-7501 data (delivery orders, packing lists)
+✓ Count only VALID 7501 line items (with values/duties)
+✓ Exclude container breakdown lines (no value, no duty)
+✓ Flag MPF anomalies (> $538.40 for single entry)
+✓ Document excluded items in metadata
+
+## 12.2 DON'Ts
+
+✗ DO NOT mix up form versions - block numbers differ!
+✗ DO NOT assume one HTS code per line item
+✗ DO NOT treat KIS CHGS field as charges (it's SPI codes)
+✗ DO NOT apply HMF to non-vessel shipments
+✗ DO NOT forget to derive line-level country of origin
+✗ DO NOT create keys that don't exist in US_Keys.xlsx
+✗ DO NOT duplicate fees at both line and shipment level
+✗ DO NOT assume Consignee address exists - check for "SAME"
+✗ DO NOT extract table headers as data values
+✗ DO NOT invent values - only extract what exists
+✗ DO NOT use `P_N` instead of `PART_NUMBER`
+✗ DO NOT include 4-digit item numbers (manifest data)
+✗ DO NOT include delivery order fields (sender, receiver, dates)
+✗ DO NOT include `unique_id` field (use ITEM_NUMBER)
+✗ DO NOT count container breakdowns as valid line items
+✗ DO NOT include lines with HTS rate "N/A" and no values
+✗ DO NOT include "SAID TO CONTAIN" manifest descriptions
+
+---
+
+# SECTION 13: OUTPUT FORMAT
+
+## 13.1 JSON Structure
+
+```json
+{
+  "extraction_metadata": {
+    "form_version": "2/18",
+    "filer_code": "916",
+    "broker": "BDP",
+    "extraction_date": "2024-07-07",
+    "page_count": 6,
+    "cbp_7501_pages": 2,
+    "total_document_items": 23,
+    "valid_7501_line_items": 1,
+    "excluded_items": {
+      "container_breakdowns": 12,
+      "manifest_items": 10
+    }
+  },
+  "shipment": {
+    "ENTRY_NUMBER": "916-5187505-5",
+    "ENTRY_TYPE": "02 ABI/P/L",
+    "SUMMARY_DATE": "07/17/2024",
+    "MODE_OF_TRANSPORT": "11",
+    "COUNTRY_OF_ORIGIN": "IE",
+    "TOTAL_ENTERED_VALUE": 1433417,
+    "MPF_AMOUNT": 538.40,
+    "HARBOR_MAINTENANCE": 1791.77,
+    "Dairy_AMOUNT": 503.60
+  },
+  "addresses": {
+    "CONSIGNEE": {
+      "NAME": "THE HERSHEY COMPANY",
+      "UNSTRUCTURED_STREET_ADDRESS": "19 E. CHOCOLATE AVE",
+      "CITY": "HERSHEY",
+      "COUNTRY_SUB_ENTITY": "PA",
+      "POSTAL_CODE": "17033"
+    },
+    "IMPORTER": { },
+    "BROKER": { }
+  },
+  "line_items": [
+    {
+      "ITEM_NUMBER": "001",
+      "PRODUCT_DESCRIPTION": "COCO IN PRP CON OV 5.5 BFA",
+      "PART_NUMBER": "496308",
+      "COUNTRY_OF_ORIGIN": "IE",
+      "MANUFACTURER_ID": "IEORNCOODUB",
+      "NET_WEIGHT_QTY": "264 BAG",
+      "ITEM_ENTERED_VALUE": 1433417,
+      "ITEM_CHARGES": "C24000",
+      "RELATIONSHIP": "NOT RELATED",
+      "hts_data": [
+        {
+          "HTS_US_CODE": "1806.20.2400",
+          "HTSUS_RATE": "5%",
+          "DUTY_AND_TAXES": 71670.85
+        },
+        {
+          "HTS_US_CODE": "499",
+          "HTSUS_RATE": "0.3464%",
+          "MPF_FEE": 4965.36,
+          "_is_fee": true,
+          "_note": "Calculated amount; actual billed is $538.40 (capped)"
+        },
+        {
+          "HTS_US_CODE": "501",
+          "HTSUS_RATE": "0.125%",
+          "HMF_FEE": 1791.77,
+          "_is_fee": true
+        },
+        {
+          "HTS_US_CODE": "110",
+          "HTSUS_RATE": "1.327%",
+          "Dairy_FEE": 503.60,
+          "_is_fee": true
+        }
+      ]
+    }
+  ],
+  "validation_results": {
+    "total_value_check": true,
+    "duty_total_check": true,
+    "hmf_mode_check": true,
+    "mpf_validation": {
+      "line_calculated": 4965.36,
+      "shipment_billed": 538.40,
+      "cap_applied": true,
+      "status": "VALID - capped at maximum"
+    },
+    "line_item_filtering": {
+      "items_in_document": 23,
+      "valid_7501_items": 1,
+      "excluded_reason": "12 container breakdowns (no values), 10 manifest items (4-digit numbers)"
+    }
+  }
+}
+```
+
+## 13.2 Field Naming Rules
+
+**CRITICAL: Use ONLY keys from US_Keys.xlsx**
+
+| WRONG | CORRECT |
+|-------|---------|
+| `P_N` | `PART_NUMBER` |
+| `unique_id` | (omit - use `ITEM_NUMBER`) |
+| `delivery_order_no` | (omit - not CBP 7501) |
+| `sender` | (omit - not CBP 7501) |
+| `receiver` | (omit - not CBP 7501) |
+| `dates` | (omit - use specific keys like `ENTRY_DATE`) |
+| `other_details` | (omit - map to specific keys or exclude) |
+| `total_items_count` | `valid_7501_line_items` in metadata |
+
+## 13.3 Handling Non-Standard Source Data
+
+When source document contains extra fields not in US_Keys:
+1. **If mappable**: Map to standard key (P_N → PART_NUMBER)
+2. **If CBP 7501 data but no key**: Note in extraction_metadata.unmapped_fields
+3. **If non-7501 data**: Exclude entirely (delivery orders, manifests)
+4. **If internal tracking**: Exclude from output (unique_id, etc.)
+```
+
+---
+
+# SECTION 14: QUICK REFERENCE TABLES
+
+## 14.1 Mode of Transport Codes
+
+| Code | Description | HMF? |
+|------|-------------|------|
+| 10 | Vessel, non-container | YES |
+| 11 | Vessel, container | YES |
+| 12 | Border, Waterborne | YES |
+| 20 | Rail, non-container | NO |
+| 21 | Rail, container | NO |
+| 30 | Truck, non-container | NO |
+| 31 | Truck, container | NO |
+| 32 | Auto | NO |
+| 40 | Air, non-container | NO |
+| 41 | Air, container | NO |
+| 50 | Mail | NO |
+| 60 | Passenger, hand-carried | NO |
+
+## 14.2 Entry Type Codes
+
+| Code | Type |
+|------|------|
+| 01 | Consumption - Free and Dutiable |
+| 02 | Consumption - Quota/Visa |
+| 03 | Consumption - AD/CVD |
+| 06 | FTZ Consumption |
+| 11 | Informal - Free and Dutiable |
+| 21 | Warehouse |
+| 23 | TIB (Temporary Importation Bond) |
+| 31 | Warehouse Withdrawal - Consumption |
+
+## 14.3 Bond Type Codes
+
+| Code | Type |
+|------|------|
+| 0 | U.S. Government / Not required |
+| 8 | Continuous |
+| 9 | Single Transaction |
+
+## 14.4 Relationship Codes
+
+| Code | Meaning |
+|------|---------|
+| Y | Related parties |
+| N | Not related |
+| NOT RELATED | Not related (expanded) |
+| RELATED | Related (expanded) |
+
+---
+
+# SECTION 15: TESTING CHECKLIST
+
+Before deployment, verify:
+
+**Form Detection & Mapping**
+- [ ] Form version detection works for 7/21, 2/18, 5/22, 10/25
+- [ ] Block number mapping correct per version
+- [ ] Entry number validation passes for all broker formats
+
+**Field Standards**
+- [ ] All standard keys from US_Keys.xlsx used (no P_N, unique_id, etc.)
+- [ ] No non-7501 fields included (sender, receiver, dates, other_details)
+- [ ] PART_NUMBER used instead of P_N
+- [ ] No unique_id field (use ITEM_NUMBER only)
+
+**Line Item Filtering**
+- [ ] 4-digit item numbers excluded (0001, 0002 = manifest)
+- [ ] Container breakdown lines excluded (no value, no duty)
+- [ ] "SAID TO CONTAIN" items excluded
+- [ ] Lines with HTSUS_RATE = "N/A" and no values excluded
+- [ ] valid_7501_line_items count accurate
+- [ ] excluded_items metadata populated
+
+**HTS Extraction**
+- [ ] Multiple HTS codes extracted per line item
+- [ ] HTS codes formatted with periods (XXXX.XX.XXXX)
+- [ ] Fee codes (499, 501, 056, 110) distinguished from HTS codes
+
+**Country & SPI**
+- [ ] Country of origin derived correctly (O+XX, MFR ID, shipment)
+- [ ] SPI codes handled per broker pattern
+
+**Fee Validation**
+- [ ] MPF cap logic verified (min $27.75, max $538.40)
+- [ ] MPF anomalies flagged (> $538.40 for single entry)
+- [ ] Line-level vs shipment-level MPF discrepancy documented
+- [ ] HMF correctly set to 0 for non-vessel modes
+
+**Address Handling**
+- [ ] Addresses extracted for CONSIGNEE, IMPORTER, BROKER
+- [ ] "SAME" consignee handled correctly
+- [ ] Filer code vs broker name noted when different
+
+**Totals Validation**
+- [ ] Total entered value = sum of line item values
+- [ ] Duty grand total = duty + tax + other fees
+- [ ] Validation results populated in output
+
+---
+
+# SECTION 16: EXAMPLE CORRECTIONS
+
+## 16.1 Before (Incorrect Extraction)
+
+```json
+{
+  "delivery_order_no": "142400557",  // ❌ Non-7501 field
+  "total_items_count": 23,           // ❌ Includes manifest data
+  "items": [
+    {
+      "unique_id": "001",            // ❌ Non-standard key
+      "P_N": "496308",               // ❌ Should be PART_NUMBER
+      ...
+    },
+    {
+      "ITEM_NUMBER": "002",          // ❌ No value/duty - container breakdown
+      "hts_data": [{"HTS_US_CODE": "1806202400", "HTSUS_RATE": "N/A"}]
+    },
+    {
+      "ITEM_NUMBER": "0001",         // ❌ 4-digit = manifest data
+      ...
+    }
+  ],
+  "sender": {...},                   // ❌ Non-7501 field
+  "receiver": {...},                 // ❌ Non-7501 field
+  "dates": {...},                    // ❌ Non-7501 field
+  "other_details": {...}             // ❌ Non-7501 field
+}
+```
+
+## 16.2 After (Correct Extraction)
+
+```json
+{
+  "extraction_metadata": {
+    "form_version": "2/18",
+    "filer_code": "916",
+    "broker": "BDP",
+    "total_document_items": 23,
+    "valid_7501_line_items": 1,
+    "excluded_items": {
+      "container_breakdowns": 12,
+      "manifest_items": 10
+    }
+  },
+  "shipment": {
+    "ENTRY_NUMBER": "916-5187505-5",
+    "MPF_AMOUNT": 614.35,
+    ...
+  },
+  "line_items": [
+    {
+      "ITEM_NUMBER": "001",
+      "PART_NUMBER": "496308",
+      "ITEM_ENTERED_VALUE": 1433417,
+      "hts_data": [
+        {"HTS_US_CODE": "1806.20.2400", "HTSUS_RATE": "5%", "DUTY_AND_TAXES": 71670.85}
+      ]
+    }
+  ],
+  "validation_results": {
+    "mpf_validation": {
+      "shipment_mpf": 614.35,
+      "expected_max": 538.40,
+      "status": "ANOMALY",
+      "flag": "MPF exceeds standard single-entry cap - review source"
+    },
+    "line_item_filtering": {
+      "items_in_document": 23,
+      "valid_7501_items": 1,
+      "excluded": "12 container breakdowns, 10 manifest items"
+    }
+  }
+}
+```
+
+---
+
+*Master Prompt Version 3.0*
+*Enhanced with single-line entry handling, MPF anomaly detection, and strict data filtering*
+*Covers: GEODIS, BDP, KIS, EFP, CH Robinson, Expeditors, DHL, UPS, Kuehne+Nagel, FedEx*
+*Form Versions: 7/21, 2/18, 5/22, 10/25*
