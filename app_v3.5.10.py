@@ -1575,539 +1575,727 @@ def index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>KlearAgent v3.5.10 - CBP 7501 with Invoice Header Filter</title>
+    <title>KlearNow · 7501 Extraction</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root {
+            --kn-primary:       #1746A2;
+            --kn-primary-dark:  #0f3480;
+            --kn-primary-light: #EBF2FF;
+            --kn-accent:        #0EA5E9;
+            --kn-success:       #16A34A;
+            --kn-success-light: #DCFCE7;
+            --kn-success-border:#86EFAC;
+            --kn-error:         #DC2626;
+            --kn-error-light:   #FEE2E2;
+            --kn-error-border:  #FCA5A5;
+            --kn-gray-50:       #F8FAFC;
+            --kn-gray-100:      #F1F5F9;
+            --kn-gray-200:      #E2E8F0;
+            --kn-gray-400:      #94A3B8;
+            --kn-gray-600:      #475569;
+            --kn-gray-800:      #1E293B;
+            --kn-border:        #E2E8F0;
+            --kn-radius:        8px;
+            --kn-radius-lg:     12px;
+            --kn-shadow:        0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
+            --kn-shadow-md:     0 4px 6px -1px rgba(0,0,0,.08);
         }
-
+        * { margin:0; padding:0; box-sizing:border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Roboto, sans-serif;
+            background: var(--kn-gray-100);
             min-height: 100vh;
+            color: var(--kn-gray-800);
+            font-size: 14px;
+        }
+
+        /* ── Navbar ── */
+        .navbar {
+            background: #fff;
+            border-bottom: 1px solid var(--kn-border);
+            height: 56px;
+            padding: 0 24px;
             display: flex;
-            justify-content: center;
             align-items: center;
-            padding: 20px;
+            justify-content: space-between;
+            position: sticky; top: 0; z-index: 100;
+            box-shadow: var(--kn-shadow);
+        }
+        .navbar-left { display:flex; align-items:center; gap:10px; }
+        .navbar-logo {
+            width:32px; height:32px;
+            background: var(--kn-primary);
+            border-radius: 8px;
+            display:flex; align-items:center; justify-content:center;
+            color:#fff; font-weight:800; font-size:13px; letter-spacing:-.5px;
+        }
+        .navbar-name  { font-weight:700; font-size:16px; color:var(--kn-primary); }
+        .navbar-sep   { width:1px; height:18px; background:var(--kn-border); margin:0 4px; }
+        .navbar-sub   { font-size:12px; color:var(--kn-gray-400); font-weight:500; }
+        .navbar-badge {
+            background:var(--kn-primary-light); color:var(--kn-primary);
+            font-size:11px; font-weight:700; padding:3px 10px; border-radius:20px;
+            letter-spacing:.2px;
         }
 
-        .container {
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            padding: 40px;
-            max-width: 600px;
-            width: 100%;
+        /* ── Layout ── */
+        .main {
+            display: grid;
+            grid-template-columns: 400px 1fr;
+            gap: 20px;
+            padding: 24px;
+            max-width: 1160px;
+            margin: 0 auto;
+        }
+        @media (max-width:800px) {
+            .main { grid-template-columns:1fr; }
+            .runs-list { max-height:360px; }
         }
 
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
+        /* ── Card ── */
+        .card {
+            background:#fff;
+            border-radius: var(--kn-radius-lg);
+            border: 1px solid var(--kn-border);
+            box-shadow: var(--kn-shadow);
+        }
+        .card-header {
+            padding:14px 18px;
+            border-bottom:1px solid var(--kn-border);
+            display:flex; align-items:center; justify-content:space-between;
+        }
+        .card-title { font-size:13px; font-weight:600; color:var(--kn-gray-800); }
+        .card-hint  { font-size:11px; color:var(--kn-gray-400); }
+        .card-body  { padding:18px; }
+
+        /* ── Upload zone ── */
+        .upload-zone {
+            border: 2px dashed var(--kn-border);
+            border-radius: var(--kn-radius);
+            padding: 36px 16px;
+            text-align:center;
+            cursor:pointer;
+            transition: all .18s;
+            background: var(--kn-gray-50);
+            user-select:none;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: var(--kn-primary);
+            background: var(--kn-primary-light);
+        }
+        .upload-zone-icon {
+            width:44px; height:44px;
+            background:var(--kn-primary-light);
+            border-radius:50%;
+            display:flex; align-items:center; justify-content:center;
+            margin: 0 auto 10px;
+        }
+        .upload-zone-icon svg { width:22px; height:22px; }
+        .upload-zone-label { font-weight:600; font-size:14px; margin-bottom:4px; }
+        .upload-zone-hint  { font-size:12px; color:var(--kn-gray-400); }
+
+        /* ── File chip ── */
+        .file-chip {
+            display:none; align-items:center; gap:10px;
+            background:var(--kn-success-light);
+            border:1px solid var(--kn-success-border);
+            border-radius: var(--kn-radius);
+            padding:10px 12px;
+            margin-top:12px;
+        }
+        .file-chip.show { display:flex; }
+        .file-chip-icon {
+            width:32px; height:32px; flex-shrink:0;
+            background:var(--kn-success); border-radius:6px;
+            display:flex; align-items:center; justify-content:center;
+        }
+        .file-chip-icon svg { width:16px; height:16px; }
+        .file-chip-name { font-size:13px; font-weight:600; }
+        .file-chip-size { font-size:11px; color:var(--kn-gray-400); margin-top:1px; }
+        .file-chip-remove {
+            margin-left:auto; background:none; border:none;
+            cursor:pointer; color:var(--kn-gray-400); padding:2px;
+            display:flex; align-items:center;
+        }
+        .file-chip-remove:hover { color:var(--kn-error); }
+
+        /* ── Progress ── */
+        .progress-wrap {
+            display:none; padding:14px 0 4px;
+        }
+        .progress-wrap.show { display:block; }
+        .progress-bar {
+            width:100%; height:3px;
+            background:var(--kn-gray-200); border-radius:2px;
+            overflow:hidden; margin-bottom:8px;
+        }
+        .progress-fill {
+            height:100%; width:35%;
+            background:var(--kn-primary); border-radius:2px;
+            animation: indeterminate 1.4s ease-in-out infinite;
+        }
+        @keyframes indeterminate {
+            0%   { transform:translateX(-100%); }
+            100% { transform:translateX(380%); }
+        }
+        .progress-label { font-size:12px; color:var(--kn-gray-600); font-weight:500; }
+
+        /* ── Inline alerts ── */
+        .alert {
+            display:none; border-radius:var(--kn-radius);
+            padding:10px 14px; margin-top:12px; font-size:13px;
+        }
+        .alert.show { display:block; }
+        .alert-success {
+            background:var(--kn-success-light);
+            border:1px solid var(--kn-success-border);
+            color:var(--kn-success);
+        }
+        .alert-success strong { font-size:13px; }
+        .alert-error {
+            background:var(--kn-error-light);
+            border:1px solid var(--kn-error-border);
+            color:var(--kn-error);
         }
 
-        .header h1 {
-            color: #333;
-            font-size: 32px;
-            margin-bottom: 10px;
+        /* ── Buttons ── */
+        .btn {
+            display:inline-flex; align-items:center; justify-content:center;
+            gap:7px; padding:10px 16px; border-radius:var(--kn-radius);
+            font-size:13px; font-weight:600; cursor:pointer; border:none;
+            transition: all .15s; text-decoration:none; width:100%;
+        }
+        .btn svg { flex-shrink:0; }
+        .btn-primary {
+            background:var(--kn-primary); color:#fff;
+            margin-top:12px;
+        }
+        .btn-primary:hover:not(:disabled) { background:var(--kn-primary-dark); }
+        .btn-primary:disabled { background:var(--kn-gray-400); cursor:not-allowed; }
+        .btn-outline {
+            background:#fff; color:var(--kn-primary);
+            border:1.5px solid var(--kn-primary);
+            margin-top:8px;
+        }
+        .btn-outline:hover { background:var(--kn-primary-light); }
+        .btn-muted {
+            background:var(--kn-gray-100); color:var(--kn-gray-600);
+            border:1px solid var(--kn-border);
+        }
+        .btn-muted:hover { background:var(--kn-gray-200); }
+        .btn-sm { padding:7px 12px; font-size:12px; width:auto; }
+
+        /* ── Divider ── */
+        .divider {
+            display:flex; align-items:center; gap:10px;
+            margin:18px 0 14px;
+        }
+        .divider::before, .divider::after {
+            content:''; flex:1; height:1px; background:var(--kn-border);
+        }
+        .divider span {
+            font-size:10px; font-weight:700; color:var(--kn-gray-400);
+            text-transform:uppercase; letter-spacing:.6px;
         }
 
-        .header p {
-            color: #666;
-            font-size: 16px;
+        /* ── Input field ── */
+        .input-row { display:flex; gap:8px; }
+        .input-field {
+            flex:1; padding:8px 12px;
+            border:1px solid var(--kn-border); border-radius:var(--kn-radius);
+            font-size:13px; outline:none; background:#fff;
+            transition:border-color .15s;
+        }
+        .input-field:focus { border-color:var(--kn-primary); }
+        .field-label {
+            font-size:12px; font-weight:600; color:var(--kn-gray-600);
+            margin-bottom:6px; display:block;
+        }
+        .field-status {
+            display:none; font-size:12px; margin-top:6px;
+            padding:6px 10px; border-radius:4px;
         }
 
-        .version {
-            background: #4CAF50;
-            color: white;
-            padding: 5px 15px;
-            border-radius: 20px;
-            font-size: 12px;
-            display: inline-block;
-            margin-top: 10px;
+        /* ── Run History ── */
+        .history-card {
+            display:flex; flex-direction:column;
+            /* fill viewport height minus navbar */
+            max-height: calc(100vh - 88px);
         }
-
-        .upload-area {
-            border: 3px dashed #667eea;
-            border-radius: 15px;
-            padding: 60px 20px;
-            text-align: center;
-            background: #f8f9ff;
-            cursor: pointer;
-            transition: all 0.3s ease;
+        .history-header {
+            padding:14px 18px;
+            border-bottom:1px solid var(--kn-border);
+            display:flex; align-items:center; justify-content:space-between;
+            flex-shrink:0;
         }
-
-        .upload-area.dragover {
-            background: #e8ebff;
-            border-color: #764ba2;
-            transform: scale(1.02);
+        .history-count {
+            background:var(--kn-gray-100); border:1px solid var(--kn-border);
+            color:var(--kn-gray-600); font-size:11px; font-weight:600;
+            padding:2px 8px; border-radius:20px;
         }
-
-        .upload-icon {
-            font-size: 64px;
-            margin-bottom: 20px;
+        .history-search {
+            padding:10px 14px;
+            border-bottom:1px solid var(--kn-border);
+            flex-shrink:0;
         }
-
-        .upload-text {
-            color: #333;
-            font-size: 18px;
-            font-weight: 500;
+        .search-input {
+            width:100%; padding:7px 10px 7px 30px;
+            border:1px solid var(--kn-border); border-radius:var(--kn-radius);
+            font-size:12px; outline:none; background:var(--kn-gray-50);
+            background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='13' height='13' viewBox='0 0 24 24' fill='none' stroke='%2394A3B8' stroke-width='2'%3E%3Ccircle cx='11' cy='11' r='8'/%3E%3Cpath d='m21 21-4.35-4.35'/%3E%3C/svg%3E");
+            background-repeat:no-repeat; background-position:10px center;
         }
-
-        .file-info {
-            display: none;
-            margin-top: 20px;
-            padding: 15px;
-            background: #e8f5e9;
-            border-radius: 10px;
-            border-left: 4px solid #4caf50;
+        .search-input:focus { border-color:var(--kn-primary); background-color:#fff; }
+        .runs-list {
+            overflow-y:auto; flex:1;
         }
-
-        .file-info.show {
-            display: block;
+        .run-item {
+            padding:12px 18px;
+            border-bottom:1px solid var(--kn-gray-100);
+            display:grid; grid-template-columns:1fr auto;
+            gap:8px; align-items:start;
+            transition:background .1s;
         }
-
-        .process-button {
-            width: 100%;
-            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
-            color: white;
-            border: none;
-            padding: 15px;
-            border-radius: 10px;
-            font-size: 18px;
-            cursor: pointer;
-            margin-top: 20px;
-            display: none;
-            font-weight: 600;
+        .run-item:hover { background:var(--kn-gray-50); }
+        .run-item:last-child { border-bottom:none; }
+        .run-entry {
+            font-size:13px; font-weight:700;
+            font-family:'SF Mono','Fira Code','Consolas',monospace;
+            color:var(--kn-gray-800); letter-spacing:.3px;
         }
-
-        .process-button.show {
-            display: block;
+        .run-file {
+            font-size:11px; color:var(--kn-gray-600); margin-top:2px;
+            overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+            max-width:240px;
         }
-
-        .process-button:disabled {
-            background: #ccc;
-            cursor: not-allowed;
+        .run-meta {
+            display:flex; align-items:center; gap:6px;
+            margin-top:5px; flex-wrap:wrap;
         }
-
-        .loading {
-            display: none;
-            text-align: center;
-            margin-top: 20px;
+        .run-time   { font-size:11px; color:var(--kn-gray-400); }
+        .run-badge  {
+            font-size:10px; font-weight:700; padding:2px 6px; border-radius:4px;
         }
-
-        .loading.show {
-            display: block;
+        .run-badge.success { background:var(--kn-success-light); color:var(--kn-success); }
+        .run-badge.failed  { background:var(--kn-error-light);   color:var(--kn-error); }
+        .run-badge.processing { background:var(--kn-primary-light); color:var(--kn-primary); }
+        .run-lines  {
+            font-size:10px; color:var(--kn-gray-400);
+            background:var(--kn-gray-100); padding:2px 5px; border-radius:4px;
         }
-
-        .spinner {
-            border: 4px solid #f3f3f3;
-            border-top: 4px solid #667eea;
-            border-radius: 50%;
-            width: 50px;
-            height: 50px;
-            animation: spin 1s linear infinite;
-            margin: 20px auto;
+        .run-actions { display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
+        .run-del {
+            background:none; border:none; cursor:pointer;
+            color:var(--kn-gray-300); padding:2px;
+            display:flex; align-items:center;
+            transition:color .15s;
         }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
+        .run-del:hover { color:var(--kn-error); }
+        .empty-state {
+            padding:60px 20px; text-align:center; color:var(--kn-gray-400);
         }
-
-        .success-message {
-            display: none;
-            margin-top: 20px;
-            padding: 15px;
-            background: #e8f5e9;
-            border-radius: 10px;
-            border-left: 4px solid #4caf50;
+        .empty-icon {
+            width:44px; height:44px; background:var(--kn-gray-100); border-radius:50%;
+            display:flex; align-items:center; justify-content:center;
+            margin:0 auto 12px;
         }
-
-        .success-message.show {
-            display: block;
-        }
-
-        .feature-list {
-            margin-top: 30px;
-            padding: 20px;
-            background: #f8f9ff;
-            border-radius: 10px;
-        }
-
-        .feature-list h3 {
-            color: #667eea;
-            margin-bottom: 15px;
-        }
-
-        .feature-list ul {
-            list-style: none;
-        }
-
-        .feature-list li {
-            padding: 8px 0;
-            color: #555;
-        }
-
-        .feature-list li:before {
-            content: "✓ ";
-            color: #4CAF50;
-            font-weight: bold;
-            margin-right: 10px;
-        }
+        .empty-state p { font-size:13px; line-height:1.6; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🚀 KlearAgent</h1>
-            <p>CBP Form 7501 AI Extraction (API 2)</p>
-            <span class="version">v3.5.7 - Complete 80 Columns</span>
-        </div>
 
-        <div class="upload-area" id="uploadArea">
-            <div class="upload-icon">📄</div>
-            <div class="upload-text">Drag & Drop CBP 7501 PDF(s) here</div>
-            <p style="margin-top: 10px; color: #666;">or click to browse (multiple files supported)</p>
-            <input type="file" id="fileInput" style="display: none;" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" multiple>
-        </div>
+<nav class="navbar">
+    <div class="navbar-left">
+        <div class="navbar-logo">KN</div>
+        <span class="navbar-name">KlearNow</span>
+        <div class="navbar-sep"></div>
+        <span class="navbar-sub">7501 Extraction</span>
+    </div>
+    <span class="navbar-badge">CBP 7501 Agent &nbsp;v3.5.10</span>
+</nav>
 
-        <div class="file-info" id="fileInfo">
-            <div style="font-weight: 600; color: #2e7d32;" id="fileName"></div>
-            <div style="color: #666; font-size: 14px; margin-top: 5px;" id="fileSize"></div>
-        </div>
+<div class="main">
 
-        <button class="process-button" id="processButton">
-            Extract & Generate JSON (Parallel Processing)
-        </button>
+    <!-- ── Left panel ───────────────────────────────────── -->
+    <div style="display:flex;flex-direction:column;gap:16px;">
 
-        <div class="loading" id="loading">
-            <div class="spinner"></div>
-            <div style="color: #667eea; font-weight: 500;">Processing document...</div>
-        </div>
-
-        <div class="success-message" id="successMessage">
-            <div style="font-weight: 600; color: #2e7d32; margin-bottom: 10px;">✅ Processing Complete!</div>
-            <div style="color: #555;" id="successDetails">JSON file downloaded successfully</div>
-        </div>
-
-        <div class="feature-list">
-            <h3>📊 Complete Field Extraction</h3>
-            <ul>
-                <li>JSON output format with metadata</li>
-                <li>All CS (Customs Summary) fields</li>
-                <li>All CM (Customs Merchandise) fields</li>
-                <li>All CD (Customs Duty) fields</li>
-                <li>One row per HTS code/line item</li>
-                <li>Complete duty and fee breakdowns</li>
-                <li>✨ Parallel processing for multiple PDFs</li>
-                <li>✨ Batch processing with ZIP download</li>
-            </ul>
-        </div>
-
-        <div style="margin-top: 30px; padding: 20px; background: #f5f5f5; border-radius: 10px; border-left: 4px solid #2196F3;">
-            <h3 style="margin: 0 0 10px 0; color: #1976D2;">💡 Manual Mode</h3>
-            <p style="margin: 0 0 15px 0; color: #666; font-size: 14px;">
-                If polling times out, download JSON from AI79 dashboard and upload it here:
-            </p>
-            <input type="file" id="jsonFileInput" accept=".json" style="display: none;">
-            <button onclick="document.getElementById('jsonFileInput').click()" 
-                    style="background: #2196F3; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: 600;">
-                📥 Upload AI79 JSON
-            </button>
-            <div id="jsonProcessing" style="display: none; margin-top: 10px; color: #1976D2;">
-                ⏳ Processing JSON...
+        <!-- Upload card -->
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">New Extraction</span>
+                <span class="card-hint">PDF &nbsp;·&nbsp; PNG &nbsp;·&nbsp; TIFF</span>
             </div>
-        </div>
+            <div class="card-body">
 
-        <div style="margin-top: 20px; padding: 20px; background: #fff3e0; border-radius: 10px; border-left: 4px solid #FF9800;">
-            <h3 style="margin: 0 0 10px 0; color: #F57C00;">🔍 Fetch by Run ID</h3>
-            <p style="margin: 0 0 15px 0; color: #666; font-size: 14px;">
-                If you have a run_id from the console, try fetching the result directly:
-            </p>
-            <div style="display: flex; gap: 10px;">
-                <input type="text" id="runIdInput" placeholder="Enter run_id (e.g., 69c26c8f-d195-4788-a294-d037107147fb)" 
-                       style="flex: 1; padding: 10px; border: 2px solid #FFB74D; border-radius: 5px; font-size: 14px;">
-                <button id="fetchRunIdButton" onclick="fetchByRunId()"
-                        style="background: #FF9800; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-weight: 600; white-space: nowrap;">
-                    🔍 Fetch Result
+                <div class="upload-zone" id="uploadZone">
+                    <div class="upload-zone-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="#1746A2" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                            <polyline points="17 8 12 3 7 8"/>
+                            <line x1="12" y1="3" x2="12" y2="15"/>
+                        </svg>
+                    </div>
+                    <div class="upload-zone-label">Drop CBP 7501 documents here</div>
+                    <div class="upload-zone-hint">or click to browse &nbsp;·&nbsp; multiple files supported</div>
+                    <input type="file" id="fileInput" style="display:none;" accept=".pdf,.png,.jpg,.jpeg,.tif,.tiff" multiple>
+                </div>
+
+                <!-- File chip -->
+                <div class="file-chip" id="fileChip">
+                    <div class="file-chip-icon">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                            <polyline points="14 2 14 8 20 8"/>
+                        </svg>
+                    </div>
+                    <div>
+                        <div class="file-chip-name" id="chipName"></div>
+                        <div class="file-chip-size" id="chipSize"></div>
+                    </div>
+                    <button class="file-chip-remove" onclick="clearFiles()">
+                        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                    </button>
+                </div>
+
+                <!-- Progress -->
+                <div class="progress-wrap" id="progressWrap">
+                    <div class="progress-bar"><div class="progress-fill"></div></div>
+                    <div class="progress-label" id="progressLabel">Sending to AI agent...</div>
+                </div>
+
+                <!-- Success alert -->
+                <div class="alert alert-success" id="alertSuccess">
+                    <strong>Extraction complete</strong>
+                    <div style="font-size:12px;margin-top:3px;color:#166534;" id="alertSuccessDetail"></div>
+                </div>
+
+                <!-- Error alert -->
+                <div class="alert alert-error" id="alertError"></div>
+
+                <!-- Run button -->
+                <button class="btn btn-primary" id="runBtn" style="display:none;" onclick="runExtraction()">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                    <span id="runBtnLabel">Run Extraction</span>
                 </button>
+
+                <!-- New Run button -->
+                <button class="btn btn-outline" id="newRunBtn" style="display:none;" onclick="newRun()">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+                    New Run
+                </button>
+
             </div>
-            <div id="runIdStatus" style="margin-top: 10px; display: none;"></div>
+        </div>
+
+        <!-- Manual recovery card -->
+        <div class="card">
+            <div class="card-header">
+                <span class="card-title">Manual Recovery</span>
+                <span class="card-hint">If polling times out</span>
+            </div>
+            <div class="card-body">
+
+                <label class="field-label">Fetch by Run ID</label>
+                <div class="input-row">
+                    <input class="input-field" id="runIdInput" type="text" placeholder="run_id from console or dashboard">
+                    <button class="btn btn-muted btn-sm" onclick="fetchByRunId()">Fetch</button>
+                </div>
+                <div class="field-status" id="runIdStatus"></div>
+
+                <div class="divider"><span>or</span></div>
+
+                <label class="field-label">Upload AI Agent JSON</label>
+                <input type="file" id="jsonFileInput" accept=".json" style="display:none;">
+                <button class="btn btn-muted" onclick="document.getElementById('jsonFileInput').click()">
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                    Upload JSON
+                </button>
+                <div class="field-status" id="jsonStatus"></div>
+
+            </div>
         </div>
     </div>
 
-    <script>
-        let selectedFiles = [];
+    <!-- ── Right panel: Run History ─────────────────────── -->
+    <div class="card history-card">
+        <div class="history-header">
+            <span class="card-title">Run History</span>
+            <span class="history-count" id="historyCount">0 runs</span>
+        </div>
+        <div class="history-search">
+            <input class="search-input" id="searchInput" type="text"
+                   placeholder="Search by entry number or filename..."
+                   oninput="renderRuns()">
+        </div>
+        <div class="runs-list" id="runsList">
+            <div class="empty-state" id="emptyState">
+                <div class="empty-icon">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                </div>
+                <p>No extractions yet.<br>Upload a CBP 7501 to get started.</p>
+            </div>
+        </div>
+    </div>
 
-        async function fetchByRunId() {
-            const runIdInput = document.getElementById('runIdInput');
-            const runIdStatus = document.getElementById('runIdStatus');
-            const fetchButton = document.getElementById('fetchRunIdButton');
-            
-            const runId = runIdInput.value.trim();
-            if (!runId) {
-                alert('Please enter a run_id');
-                return;
-            }
-            
-            runIdStatus.style.display = 'block';
-            runIdStatus.style.color = '#F57C00';
-            runIdStatus.innerHTML = '🔄 Fetching results...';
-            fetchButton.disabled = true;
-            
-            try {
-                const response = await fetch('/fetch-by-runid', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ run_id: runId })
-                });
-                
-                const result = await response.json();
-                
-                if (response.ok && result.success) {
-                    runIdStatus.style.color = '#2e7d32';
-                    runIdStatus.innerHTML = '✅ Results fetched! Processing to JSON...';
-                    
-                    // Now process the data through the normalization endpoint
-                    const processResponse = await fetch('/process-json-data', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(result.data)
-                    });
-                    
-                    if (processResponse.ok) {
-                        const blob = await processResponse.blob();
-                        const url = window.URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = `cbp7501_runid_${new Date().getTime()}.json`;
-                        document.body.appendChild(a);
-                        a.click();
-                        window.URL.revokeObjectURL(url);
-                        document.body.removeChild(a);
-                        
-                        runIdStatus.innerHTML = '✅ Success! JSON file downloaded.';
-                        runIdInput.value = '';
-                    } else {
-                        throw new Error('Failed to process data to JSON');
-                    }
-                } else {
-                    runIdStatus.style.color = '#d32f2f';
-                    runIdStatus.innerHTML = `❌ ${result.error || result.message || 'Could not fetch results'}`;
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                runIdStatus.style.color = '#d32f2f';
-                runIdStatus.innerHTML = '❌ Error fetching results. Please try manual JSON upload.';
-            } finally {
-                fetchButton.disabled = false;
-            }
+</div>
+
+<script>
+let selectedFiles = [];
+let runs = [];
+const STORAGE_KEY = 'kn_7501_runs';
+
+// ── Init ──────────────────────────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => { loadRuns(); renderRuns(); });
+
+// ── Upload zone ───────────────────────────────────────────────────────────
+const uploadZone = document.getElementById('uploadZone');
+const fileInput  = document.getElementById('fileInput');
+
+['dragenter','dragover','dragleave','drop'].forEach(ev =>
+    uploadZone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); }));
+['dragenter','dragover'].forEach(ev =>
+    uploadZone.addEventListener(ev, () => uploadZone.classList.add('dragover')));
+['dragleave','drop'].forEach(ev =>
+    uploadZone.addEventListener(ev, () => uploadZone.classList.remove('dragover')));
+uploadZone.addEventListener('drop', e => {
+    const f = Array.from(e.dataTransfer.files);
+    if (f.length) handleFiles(f);
+});
+uploadZone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => { if (e.target.files.length) handleFiles(Array.from(e.target.files)); });
+
+function handleFiles(files) {
+    selectedFiles = files;
+    const total = files.reduce((s, f) => s + f.size, 0);
+    document.getElementById('chipName').textContent =
+        files.length === 1 ? files[0].name : `${files.length} files selected`;
+    document.getElementById('chipSize').textContent = formatBytes(files.length === 1 ? files[0].size : total);
+    document.getElementById('fileChip').classList.add('show');
+    document.getElementById('runBtnLabel').textContent =
+        files.length > 1 ? `Run Extraction  (${files.length} files)` : 'Run Extraction';
+    document.getElementById('runBtn').style.display = 'flex';
+    document.getElementById('newRunBtn').style.display = 'none';
+    hide('alertSuccess'); hide('alertError'); hide('progressWrap');
+}
+
+function clearFiles() {
+    selectedFiles = []; fileInput.value = '';
+    document.getElementById('fileChip').classList.remove('show');
+    document.getElementById('runBtn').style.display = 'none';
+    document.getElementById('newRunBtn').style.display = 'none';
+    hide('alertSuccess'); hide('alertError'); hide('progressWrap');
+}
+
+function newRun() { clearFiles(); }
+
+// ── Run extraction ────────────────────────────────────────────────────────
+async function runExtraction() {
+    if (!selectedFiles.length) return;
+
+    const runBtn = document.getElementById('runBtn');
+    runBtn.disabled = true;
+    hide('alertSuccess'); hide('alertError');
+    show('progressWrap');
+    setLabel('progressLabel',
+        selectedFiles.length > 1 ? `Processing ${selectedFiles.length} documents...` : 'Sending to AI agent...');
+
+    // Pending run record
+    const rid = 'run_' + Date.now();
+    runs.unshift({
+        id: rid,
+        timestamp: new Date().toISOString(),
+        filenames: selectedFiles.map(f => f.name),
+        status: 'processing',
+        entry_number: null, line_count: null,
+    });
+    saveRuns(); renderRuns();
+
+    const fd = new FormData();
+    if (selectedFiles.length === 1) fd.append('file', selectedFiles[0]);
+    else selectedFiles.forEach(f => fd.append('files[]', f));
+
+    try {
+        setLabel('progressLabel', 'AI agent processing — this may take a few minutes...');
+        const res = await fetch('/upload', { method: 'POST', body: fd });
+
+        if (!res.ok) {
+            let msg = `Error ${res.status}`;
+            try { const d = await res.json(); msg = d.error || msg; } catch(e) {}
+            throw new Error(msg);
         }
 
-        const uploadArea = document.getElementById('uploadArea');
-        const fileInput = document.getElementById('fileInput');
-        const fileInfo = document.getElementById('fileInfo');
-        const fileName = document.getElementById('fileName');
-        const fileSize = document.getElementById('fileSize');
-        const processButton = document.getElementById('processButton');
-        const loading = document.getElementById('loading');
-        const successMessage = document.getElementById('successMessage');
-        const successDetails = document.getElementById('successDetails');
+        const blob     = await res.blob();
+        const isZip    = res.headers.get('content-type')?.includes('zip');
+        const basename = selectedFiles.length > 1 ? 'cbp7501_batch' : `cbp7501_${selectedFiles[0].name.replace(/\\.[^/.]+$/, '')}`;
+        const filename = `${basename}_${Date.now()}.${isZip ? 'zip' : 'json'}`;
 
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-            uploadArea.addEventListener(eventName, (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-            }, false);
-        });
-
-        ['dragenter', 'dragover'].forEach(eventName => {
-            uploadArea.addEventListener(eventName, () => {
-                uploadArea.classList.add('dragover');
-            }, false);
-        });
-
-        ['dragleave', 'drop'].forEach(eventName => {
-            uploadArea.addEventListener(eventName, () => {
-                uploadArea.classList.remove('dragover');
-            }, false);
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            const files = Array.from(e.dataTransfer.files);
-            if (files.length > 0) {
-                handleFiles(files);
-            }
-        }, false);
-
-        uploadArea.addEventListener('click', () => {
-            fileInput.click();
-        });
-
-        fileInput.addEventListener('change', (e) => {
-            if (e.target.files.length > 0) {
-                handleFiles(Array.from(e.target.files));
-            }
-        });
-
-        function handleFiles(files) {
-            selectedFiles = files;
-            const totalSize = files.reduce((sum, file) => sum + file.size, 0);
-            
-            if (files.length === 1) {
-                fileName.textContent = `📎 ${files[0].name}`;
-                fileSize.textContent = `Size: ${formatBytes(files[0].size)}`;
-            } else {
-                fileName.textContent = `📎 ${files.length} files selected`;
-                fileSize.textContent = `Total size: ${formatBytes(totalSize)}`;
-            }
-            
-            fileInfo.classList.add('show');
-            processButton.classList.add('show');
-            
-            if (files.length > 1) {
-                processButton.textContent = `Process ${files.length} PDFs (Parallel)`;
-            } else {
-                processButton.textContent = 'Extract & Generate JSON';
-            }
+        let entryNumber = null, lineCount = null;
+        if (!isZip) {
+            try {
+                const t = await blob.text();
+                const d = JSON.parse(t);
+                entryNumber = d?.shipment?.ENTRY_NUMBER || d?.ENTRY_NUMBER || null;
+                lineCount   = d?.line_items?.length
+                           || d?.extraction_metadata?.valid_7501_line_items
+                           || null;
+            } catch(e) {}
         }
 
-        function formatBytes(bytes) {
-            if (bytes === 0) return '0 Bytes';
-            const k = 1024;
-            const sizes = ['Bytes', 'KB', 'MB'];
-            const i = Math.floor(Math.log(bytes) / Math.log(k));
-            return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
-        }
+        downloadBlob(blob, filename);
 
-        processButton.addEventListener('click', async () => {
-            if (selectedFiles.length === 0) return;
+        const idx = runs.findIndex(r => r.id === rid);
+        if (idx !== -1) Object.assign(runs[idx], { status:'success', entry_number:entryNumber, line_count:lineCount, filename });
+        saveRuns(); renderRuns();
 
-            processButton.disabled = true;
-            loading.classList.add('show');
-            successMessage.classList.remove('show');
-            loading.querySelector('div').textContent = selectedFiles.length > 1 
-                ? `Processing ${selectedFiles.length} documents in parallel...` 
-                : 'Processing document...';
+        hide('progressWrap');
+        document.getElementById('alertSuccessDetail').textContent =
+            lineCount ? `${lineCount} line items extracted  ·  ${filename}` : `Downloaded: ${filename}`;
+        show('alertSuccess');
+        document.getElementById('newRunBtn').style.display = 'flex';
+        document.getElementById('fileChip').classList.remove('show');
 
-            const formData = new FormData();
-            
-            // Append files as 'files[]' for multiple or 'file' for single
-            if (selectedFiles.length === 1) {
-                formData.append('file', selectedFiles[0]);
-            } else {
-                selectedFiles.forEach(file => {
-                    formData.append('files[]', file);
-                });
-            }
+    } catch(err) {
+        const idx = runs.findIndex(r => r.id === rid);
+        if (idx !== -1) Object.assign(runs[idx], { status:'failed', error: err.message });
+        saveRuns(); renderRuns();
+        hide('progressWrap');
+        document.getElementById('alertError').textContent = err.message;
+        show('alertError');
+        runBtn.disabled = false;
+    }
+}
 
-            try {
-                const response = await fetch('/upload', {
-                    method: 'POST',
-                    body: formData
-                });
+// ── Run History ───────────────────────────────────────────────────────────
+function loadRuns()  { try { runs = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e) { runs=[]; } }
+function saveRuns()  { if (runs.length>100) runs=runs.slice(0,100); localStorage.setItem(STORAGE_KEY, JSON.stringify(runs)); }
+function deleteRun(id) { runs = runs.filter(r=>r.id!==id); saveRuns(); renderRuns(); }
 
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    
-                    // Determine file extension based on content type
-                    const contentType = response.headers.get('content-type');
-                    const isZip = contentType && contentType.includes('zip');
-                    const extension = isZip ? 'zip' : 'json';
-                    const filename = selectedFiles.length > 1 
-                        ? `cbp7501_batch_${new Date().getTime()}.zip`
-                        : `cbp7501_${selectedFiles[0].name.replace(/\.[^/.]+$/, '')}_${new Date().getTime()}.json`;
-                    
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                    document.body.removeChild(a);
+function renderRuns() {
+    const q      = (document.getElementById('searchInput')?.value || '').toLowerCase();
+    const list   = document.getElementById('runsList');
+    const badge  = document.getElementById('historyCount');
+    badge.textContent = `${runs.length} run${runs.length!==1?'s':''}`;
 
-                    loading.classList.remove('show');
-                    successMessage.classList.add('show');
-                    successDetails.textContent = selectedFiles.length > 1
-                        ? `${selectedFiles.length} files processed. ZIP archive downloaded.`
-                        : 'JSON file downloaded successfully.';
-                    
-                    // Reset
-                    selectedFiles = [];
-                    fileInfo.classList.remove('show');
-                    processButton.classList.remove('show');
-                    fileInput.value = '';
-                } else {
-                    // Try to get error message from response
-                    let errorMessage = 'Error processing file(s). Please try again.';
-                    try {
-                        const errorData = await response.json();
-                        if (errorData.error) {
-                            errorMessage = `Error: ${errorData.error}`;
-                        }
-                    } catch (e) {
-                        errorMessage = `Error: ${response.status} ${response.statusText}`;
-                    }
-                    throw new Error(errorMessage);
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                loading.classList.remove('show');
-                alert(error.message || 'Error processing file(s). Please try again.');
-                processButton.disabled = false;
-            }
-        });
+    const filtered = q ? runs.filter(r =>
+        (r.entry_number||'').toLowerCase().includes(q) ||
+        (r.filenames||[r.filename||'']).join(' ').toLowerCase().includes(q)
+    ) : runs;
 
-        // Handle manual JSON upload
-        const jsonFileInput = document.getElementById('jsonFileInput');
-        const jsonProcessing = document.getElementById('jsonProcessing');
+    if (!filtered.length) {
+        list.innerHTML = '';
+        list.innerHTML = `<div class="empty-state">
+            <div class="empty-icon">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+            </div>
+            <p>${q ? 'No runs match your search.' : 'No extractions yet.<br>Upload a CBP 7501 to get started.'}</p>
+        </div>`;
+        return;
+    }
 
-        jsonFileInput.addEventListener('change', async (e) => {
-            if (e.target.files.length === 0) return;
-            
-            const jsonFile = e.target.files[0];
-            jsonProcessing.style.display = 'block';
-            
-            const formData = new FormData();
-            formData.append('file', jsonFile);
-            
-            try {
-                const response = await fetch('/process-json', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (response.ok) {
-                    const blob = await response.blob();
-                    const url = window.URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `cbp7501_manual_${new Date().getTime()}.xlsx`;
-                    document.body.appendChild(a);
-                    a.click();
-                    window.URL.revokeObjectURL(url);
-                    document.body.removeChild(a);
-                    
-                    jsonProcessing.style.display = 'none';
-                    alert('✅ JSON processed successfully! Excel file downloaded.');
-                } else {
-                    throw new Error('Processing failed');
-                }
-            } catch (error) {
-                console.error('Error:', error);
-                jsonProcessing.style.display = 'none';
-                alert('❌ Error processing JSON. Please check the file format.');
-            }
-            
-            // Reset input
-            jsonFileInput.value = '';
-        });
-    </script>
+    list.innerHTML = filtered.map(r => {
+        const names   = r.filenames || (r.filename ? [r.filename] : ['Unknown']);
+        const display = names.length > 1 ? `${names.length} files` : names[0];
+        const ts      = new Date(r.timestamp);
+        const time    = ts.toLocaleDateString('en-US',{month:'short',day:'numeric'})
+                      + '  ·  '
+                      + ts.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
+        const label   = r.status==='processing' ? 'Running' : r.status==='success' ? 'Success' : 'Failed';
+        return `<div class="run-item">
+            <div>
+                <div class="run-entry">${r.entry_number || '&mdash;'}</div>
+                <div class="run-file" title="${display}">${display}</div>
+                <div class="run-meta">
+                    <span class="run-time">${time}</span>
+                    <span class="run-badge ${r.status}">${label}</span>
+                    ${r.line_count ? `<span class="run-lines">${r.line_count}&thinsp;lines</span>` : ''}
+                </div>
+            </div>
+            <div class="run-actions">
+                <button class="run-del" onclick="deleteRun('${r.id}')" title="Remove">
+                    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+                </button>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+// ── Fetch by Run ID ───────────────────────────────────────────────────────
+async function fetchByRunId() {
+    const inp    = document.getElementById('runIdInput');
+    const status = document.getElementById('runIdStatus');
+    const id     = inp.value.trim();
+    if (!id) return;
+
+    setStatus(status, 'Fetching...', 'info');
+    try {
+        const r1 = await fetch('/fetch-by-runid',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({run_id:id})});
+        const d1 = await r1.json();
+        if (!r1.ok || !d1.success) throw new Error(d1.error||'Could not fetch');
+
+        setStatus(status, 'Processing...', 'info');
+        const r2 = await fetch('/process-json-data',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(d1.data)});
+        if (!r2.ok) throw new Error('Processing failed');
+
+        downloadBlob(await r2.blob(), `cbp7501_runid_${Date.now()}.json`);
+        setStatus(status, 'Downloaded successfully', 'success');
+        inp.value = '';
+        runs.unshift({id:'fetch_'+Date.now(),timestamp:new Date().toISOString(),filenames:[`run_id: ${id}`],status:'success',entry_number:null,line_count:null});
+        saveRuns(); renderRuns();
+    } catch(e) { setStatus(status, e.message, 'error'); }
+}
+
+// ── Manual JSON ───────────────────────────────────────────────────────────
+document.getElementById('jsonFileInput').addEventListener('change', async e => {
+    if (!e.target.files.length) return;
+    const status = document.getElementById('jsonStatus');
+    setStatus(status, 'Processing...', 'info');
+    const fd = new FormData(); fd.append('file', e.target.files[0]);
+    try {
+        const res = await fetch('/process-json',{method:'POST',body:fd});
+        if (!res.ok) throw new Error('Processing failed');
+        downloadBlob(await res.blob(), `cbp7501_manual_${Date.now()}.xlsx`);
+        setStatus(status, 'Downloaded successfully', 'success');
+    } catch(err) { setStatus(status, err.message, 'error'); }
+    e.target.value = '';
+    setTimeout(()=>{ status.style.display='none'; }, 3500);
+});
+
+// ── Helpers ───────────────────────────────────────────────────────────────
+function show(id) { document.getElementById(id).classList.add('show'); }
+function hide(id) { document.getElementById(id).classList.remove('show'); }
+function setLabel(id, text) { document.getElementById(id).textContent = text; }
+
+function setStatus(el, msg, type) {
+    el.style.display = 'block';
+    const colors = {
+        info:    {bg:'var(--kn-primary-light)',  color:'var(--kn-primary)'},
+        success: {bg:'var(--kn-success-light)',  color:'var(--kn-success)'},
+        error:   {bg:'var(--kn-error-light)',    color:'var(--kn-error)'},
+    };
+    const c = colors[type] || colors.info;
+    el.style.background = c.bg; el.style.color = c.color;
+    el.style.padding = '6px 10px'; el.style.borderRadius = '4px';
+    el.textContent = msg;
+}
+
+function downloadBlob(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    URL.revokeObjectURL(url); document.body.removeChild(a);
+}
+
+function formatBytes(b) {
+    if (!b) return '0 B';
+    const k=1024, s=['B','KB','MB'];
+    const i=Math.floor(Math.log(b)/Math.log(k));
+    return (b/Math.pow(k,i)).toFixed(1)+' '+s[i];
+}
+</script>
 </body>
 </html>
+
     """
     return render_template_string(html_template)
 
