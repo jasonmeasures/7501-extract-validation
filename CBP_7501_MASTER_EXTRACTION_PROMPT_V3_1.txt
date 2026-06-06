@@ -828,6 +828,58 @@ RULE 4: Both can appear together
 
 ---
 
+## 7.6 Value Extraction Completeness — CRITICAL
+
+**Every real line item that has an HTS code MUST have an ITEM_ENTERED_VALUE. A null entered value on a duty-bearing line is almost always an extraction failure, not a property of the data.**
+
+### Why This Matters:
+The sum of all ITEM_ENTERED_VALUE across line_items MUST equal TOTAL_ENTERED_VALUE (Box 35).
+If any line is missing its value, the shipment total will not reconcile.
+
+### Mandatory Extraction Sequence for ITEM_ENTERED_VALUE:
+
+**STEP 1 — Read Box 32 (old) / Box 36 (new) directly for each line.**
+The entered value is a dollar amount on the same horizontal band as the line number and HTS code.
+It is labeled "Entered Value" or appears in column 32A/36A.
+
+**STEP 2 — If not found in Step 1, scan forward in the document.**
+Some brokers print entered values on a continuation or summary page for each invoice group.
+Look for a table column labeled "Value", "Entered Value", "Entered Val", or "NEV" that corresponds to this line number.
+
+**STEP 3 — If the document explicitly shows one total value for a group of lines:**
+Use the apportionment from the invoice. If invoices show per-line values, use those.
+If only a grouped total is visible, distribute proportionally based on duty amounts:
+`line_value = (line_duty / group_total_duty) * group_total_value`
+Set `"_value_source": "apportioned"` in the line item to flag this.
+
+**STEP 4 — Only set ITEM_ENTERED_VALUE to null if:**
+- The line is a confirmed continuation/container-breakdown line (no HTS code, no duty, 4-digit item number)
+- The line is a manifest-only informational line
+- After exhausting Steps 1–3, no value can be determined
+
+### Value Location Checklist (scan these for each missing value):
+```
+□ Box 32 / 32A (same row as line number)
+□ Box 36 / 36A on new-format forms
+□ Invoice subtotal table (often at bottom of invoice section)
+□ Last page "Value Reconciliation" block (NEV = total entered value)
+□ Column labeled "Value" in any tabular line-item listing
+□ Amount column in SAME ROW as the HTS code
+```
+
+### Cross-Check Before Finalizing:
+```
+sum(line_items[i].ITEM_ENTERED_VALUE for all i where value is not null)
+  MUST equal TOTAL_ENTERED_VALUE from Box 35.
+
+If sum ≠ TOTAL_ENTERED_VALUE:
+  → Identify which lines have null ITEM_ENTERED_VALUE
+  → Re-examine those line rows on the source document
+  → Do not finalize extraction until all values are accounted for
+```
+
+---
+
 # SECTION 8: HTS/DUTY EXTRACTION (LINE_ITEM_LEVEL_II)
 
 ## 8.1 Required Fields

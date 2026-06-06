@@ -11,6 +11,7 @@ import logging
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import zipfile
+from self_healing_orchestrator import SelfHealingOrchestrator
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
@@ -64,10 +65,12 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # Claude API Configuration
-# Load Claude API key from environment variable for security
-CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', '')  # Set environment variable CLAUDE_API_KEY
+CLAUDE_API_KEY = os.environ.get('CLAUDE_API_KEY', '')
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
+
+# Self-healing: set SELF_HEALING=false to disable (defaults to enabled when CLAUDE_API_KEY is set)
+SELF_HEALING_ENABLED = os.environ.get('SELF_HEALING', 'true').lower() != 'false'
 
 
 class CBP7501Normalizer:
@@ -558,50 +561,45 @@ class CBP7501Normalizer:
         # Filter out invoice header lines
         filtered_items = []
         for item in items:
-            line_no = item.get('line_no', '') or item.get('line_item_number', '') or ''
-            description = item.get('description_of_merchandise', '') or item.get('description', '') or ''
-            
+            # Support both uppercase (A79 agent format) and lowercase key names
+            line_no = (item.get('ITEM_NUMBER') or item.get('line_no') or
+                       item.get('line_item_number') or item.get('item_number') or '')
+            description = (item.get('PRODUCT_DESCRIPTION') or item.get('description_of_merchandise') or
+                           item.get('description') or item.get('product_description') or '')
+
             # Skip invoice header lines
-            # Indicators: line_no starts with "INV#" or description contains "Commercial Invoice #:"
             is_invoice_header = False
-            
-            if isinstance(line_no, str):
-                if line_no.upper().startswith('INV'):
-                    is_invoice_header = True
-                    print(f"      ⚠️  Skipping invoice header line: {line_no}")
-            
+            if isinstance(line_no, str) and line_no.upper().startswith('INV'):
+                is_invoice_header = True
+                print(f"      ⚠️  Skipping invoice header line: {line_no}")
             if isinstance(description, str):
                 if 'Commercial Invoice #:' in description or 'COMMERCIAL INVOICE #:' in description.upper():
                     is_invoice_header = True
                     if not isinstance(line_no, str) or not line_no.upper().startswith('INV'):
                         print(f"      ⚠️  Skipping invoice header by description: {description[:50]}...")
-            
-            # Skip lines with no entered_value and no HTS code (likely summary lines)
-            # Check for entered_value at item level or nested in primary_hts
-            has_value = item.get('entered_value') is not None
-            if not has_value and 'primary_hts' in item:
-                primary_hts = item['primary_hts']
-                if isinstance(primary_hts, dict):
-                    has_value = primary_hts.get('entered_value') is not None
-            
-            # Check for HTS code at item level or nested in primary_hts
-            has_hts = (item.get('htsus_no') or item.get('a_htsus_no') or 
-                      item.get('hts_code') or item.get('hts_us_no'))
-            if not has_hts and 'primary_hts' in item:
-                primary_hts = item['primary_hts']
-                if isinstance(primary_hts, dict):
-                    has_hts = bool(primary_hts.get('hts_code') or primary_hts.get('htsus_no'))
-            
+
+            # Check for value — uppercase (ITEM_ENTERED_VALUE) or lowercase (entered_value)
+            has_value = (item.get('ITEM_ENTERED_VALUE') is not None or
+                         item.get('entered_value') is not None)
+            if not has_value and isinstance(item.get('primary_hts'), dict):
+                has_value = item['primary_hts'].get('entered_value') is not None
+
+            # Check for HTS code — hts_data array (A79 format) or legacy scalar fields
+            has_hts = bool(item.get('hts_data') or item.get('htsus_no') or
+                           item.get('a_htsus_no') or item.get('hts_code') or item.get('hts_us_no') or
+                           item.get('HTS_US_CODE'))
+            if not has_hts and isinstance(item.get('primary_hts'), dict):
+                has_hts = bool(item['primary_hts'].get('hts_code') or item['primary_hts'].get('htsus_no'))
+
+            has_primary_hts = isinstance(item.get('primary_hts'), dict)
+            line_no_str = str(line_no)
+
             if not is_invoice_header:
-                # Only include items that have either a value or an HTS code
-                # This filters out summary/header lines without being too aggressive
-                # Also include items with primary_hts object (even if empty) as they're valid line items
-                has_primary_hts = 'primary_hts' in item and isinstance(item.get('primary_hts'), dict)
-                if has_value or has_hts or has_primary_hts or (isinstance(line_no, str) and line_no.isdigit()):
+                if has_value or has_hts or has_primary_hts or line_no_str.isdigit():
                     filtered_items.append(item)
                 else:
-                    print(f"      ⚠️  Skipping line without value/HTS: {line_no}")
-        
+                    print(f"      ⚠️  Skipping line without value/HTS: {line_no_str!r}")
+
         print(f"      📊 Filtered: {len(items)} → {len(filtered_items)} line items (skipped {len(items) - len(filtered_items)} header/summary lines)")
         return filtered_items
     
@@ -772,22 +770,27 @@ class CBP7501Normalizer:
         
         return output_path
     
-    def to_json(self, normalized_data: List[Dict], output_path: str, indent: int = 2, extracted_data: Dict = None, raw_a79_data: Dict = None) -> str:
-        """Export JSON exactly as it comes from A79 - header + items array, no modifications"""
-        # Prefer raw_a79_data (unparsed) over extracted_data (parsed) to preserve all header fields
+    def to_json(self, normalized_data: List[Dict], output_path: str, indent: int = 2,
+                extracted_data: Dict = None, raw_a79_data: Dict = None,
+                value_audit: Dict = None, confidence: Dict = None, heal_log: List = None) -> str:
+        """Export JSON: raw A79 data enriched with audit, confidence, and heal log."""
         if raw_a79_data:
-            output = raw_a79_data
+            output = dict(raw_a79_data)
         elif extracted_data:
-            output = extracted_data
+            output = dict(extracted_data)
         else:
             raise ValueError("No data to export")
-        
-        # Export exactly as it comes from A79 - no modifications, no normalization
-        # This preserves all header fields (document_type, filer_code_entry_number, etc.)
-        # and the items array exactly as A79 returns it
+
+        if value_audit is not None:
+            output['_value_audit'] = value_audit
+        if confidence is not None:
+            output['_confidence'] = confidence
+        if heal_log:
+            output['_heal_log'] = heal_log
+
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=indent, ensure_ascii=False)
-        
+
         return output_path
 
 
@@ -1883,7 +1886,69 @@ def index():
             font-size:10px; color:var(--kn-gray-400);
             background:var(--kn-gray-100); padding:2px 5px; border-radius:4px;
         }
+        .run-value-ok {
+            font-size:10px; color:var(--kn-success);
+            background:var(--kn-success-light); padding:2px 5px; border-radius:4px;
+        }
+        .run-value-warn {
+            font-size:10px; color:#B45309;
+            background:#FEF3C7; padding:2px 5px; border-radius:4px; cursor:default;
+        }
         .run-actions { display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
+
+        /* ── Quality Report panel ─────────────────────────────── */
+        .qr-panel {
+            margin-top:12px;
+            border:1px solid var(--kn-border);
+            border-radius:var(--kn-radius);
+            background:#fff;
+            overflow:hidden;
+        }
+        .qr-header {
+            display:flex; justify-content:space-between; align-items:center;
+            padding:10px 14px;
+            background:var(--kn-gray-50);
+            border-bottom:1px solid var(--kn-border);
+        }
+        .qr-title  { font-size:12px; font-weight:600; color:var(--kn-gray-800); }
+        .qr-score-badge {
+            font-size:11px; font-weight:700; padding:2px 8px;
+            border-radius:20px; letter-spacing:.02em;
+        }
+        .qr-body   { padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
+        .qr-value-banner {
+            padding:8px 10px; border-radius:6px;
+            background:var(--kn-gray-50); border:1px solid var(--kn-border);
+        }
+        .qr-value-detail { font-size:13px; font-weight:600; color:var(--kn-gray-700); }
+        .qr-value-sub { font-size:11px; color:var(--kn-gray-400); margin-top:3px; }
+        .qr-section-title {
+            font-size:11px; font-weight:600; color:var(--kn-gray-600);
+            margin-bottom:6px;
+        }
+        .qr-table {
+            width:100%; border-collapse:collapse;
+            font-size:11px; color:var(--kn-gray-600);
+        }
+        .qr-table th {
+            text-align:left; padding:4px 6px;
+            background:var(--kn-gray-100);
+            border-bottom:1px solid var(--kn-border);
+            font-weight:600; font-size:10px; color:var(--kn-gray-400);
+            text-transform:uppercase; letter-spacing:.05em;
+        }
+        .qr-table td { padding:5px 6px; border-bottom:1px solid var(--kn-gray-100); }
+        .qr-table tr:last-child td { border-bottom:none; }
+        .qr-table .qr-num { text-align:right; }
+        .qr-table td.missing { color:var(--kn-error); font-weight:500; }
+        .qr-toggle-btn {
+            display:flex; align-items:center; gap:5px;
+            background:none; border:none; cursor:pointer;
+            font-size:11px; color:var(--kn-primary); padding:4px 0;
+            font-weight:500;
+        }
+        .qr-toggle-btn:hover { opacity:.8; }
+        .qr-breakdown { margin-top:6px; }
         .run-del {
             background:none; border:none; cursor:pointer;
             color:var(--kn-gray-300); padding:2px;
@@ -1971,6 +2036,44 @@ def index():
 
                 <!-- Error alert -->
                 <div class="alert alert-error" id="alertError"></div>
+
+                <!-- Quality Report panel -->
+                <div class="qr-panel" id="qualityPanel" style="display:none;">
+                    <div class="qr-header">
+                        <span class="qr-title">Extraction Quality</span>
+                        <span class="qr-score-badge" id="qrScoreBadge"></span>
+                    </div>
+                    <div class="qr-body">
+                        <!-- Escalation banner (human review needed) -->
+                        <div id="qrEscalateBanner" style="display:none; background:#FEF2F2; border:1px solid #FCA5A5; border-radius:5px; padding:8px 10px;">
+                            <div style="font-size:12px; font-weight:700; color:#DC2626;">🚩 Human review recommended</div>
+                            <div style="font-size:11px; color:#991B1B; margin-top:3px;" id="qrEscalateReasons"></div>
+                        </div>
+                        <!-- Healing activity strip -->
+                        <div id="qrHealStrip" style="display:none; background:#EFF6FF; border:1px solid #BFDBFE; border-radius:5px; padding:7px 10px;">
+                            <div style="font-size:11px; color:#1E40AF;" id="qrHealDetail"></div>
+                        </div>
+                        <!-- Value summary banner -->
+                        <div class="qr-value-banner" id="qrValueBanner">
+                            <div class="qr-value-detail" id="qrValueDetail"></div>
+                            <div class="qr-value-sub" id="qrValueSub"></div>
+                        </div>
+                        <!-- Sequence gap warning -->
+                        <div id="qrGapWrap" style="display:none; background:#FEF9C3; border:1px solid #FDE047; border-radius:5px; padding:8px 10px;">
+                            <div style="font-size:12px; font-weight:600; color:#854D0E;" id="qrGapTitle"></div>
+                            <div style="font-size:11px; color:#713F12; margin-top:2px;" id="qrGapDetail"></div>
+                        </div>
+                        <!-- Missing lines table -->
+                        <div id="qrMissingWrap" style="display:none;">
+                            <div class="qr-section-title" id="qrMissingTitle"></div>
+                            <table class="qr-table">
+                                <thead><tr><th>#</th><th>Description</th><th>HTS Code</th></tr></thead>
+                                <tbody id="qrMissingBody"></tbody>
+                            </table>
+                            <div id="qrMissingMore" style="display:none; font-size:11px; color:var(--kn-gray-400); margin-top:6px; padding-left:4px;"></div>
+                        </div>
+                    </div>
+                </div>
 
                 <!-- Run button -->
                 <button class="btn btn-primary" id="runBtn" style="display:none;" onclick="runExtraction()">
@@ -2084,6 +2187,7 @@ function clearFiles() {
     document.getElementById('runBtn').style.display = 'none';
     document.getElementById('newRunBtn').style.display = 'none';
     hide('alertSuccess'); hide('alertError'); hide('progressWrap');
+    hideQualityPanel();
 }
 
 function newRun() { clearFiles(); }
@@ -2129,7 +2233,7 @@ async function runExtraction() {
         const basename = selectedFiles.length > 1 ? 'cbp7501_batch' : `cbp7501_${selectedFiles[0].name.replace(/\\.[^/.]+$/, '')}`;
         const filename = `${basename}_${Date.now()}.${isZip ? 'zip' : 'json'}`;
 
-        let entryNumber = null, lineCount = null;
+        let entryNumber = null, lineCount = null, valueAudit = null, confidence = null, healLog = null;
         if (!isZip) {
             try {
                 const t = await blob.text();
@@ -2138,19 +2242,35 @@ async function runExtraction() {
                 lineCount   = d?.line_items?.length
                            || d?.extraction_metadata?.valid_7501_line_items
                            || null;
+                valueAudit  = d?._value_audit || null;
+                confidence  = d?._confidence || null;
+                healLog     = d?._heal_log || null;
             } catch(e) {}
         }
 
         downloadBlob(blob, filename);
 
         const idx = runs.findIndex(r => r.id === rid);
-        if (idx !== -1) Object.assign(runs[idx], { status:'success', entry_number:entryNumber, line_count:lineCount, filename });
+        if (idx !== -1) Object.assign(runs[idx], { status:'success', entry_number:entryNumber, line_count:lineCount, filename, value_audit:valueAudit });
         saveRuns(); renderRuns();
 
         hide('progressWrap');
-        document.getElementById('alertSuccessDetail').textContent =
-            lineCount ? `${lineCount} line items extracted  ·  ${filename}` : `Downloaded: ${filename}`;
+
+        // Build success detail text including value audit status
+        let detailText = lineCount ? `${lineCount} line items extracted  ·  ${filename}` : `Downloaded: ${filename}`;
+        if (valueAudit) {
+            const missingCount = (valueAudit.missing_value_lines || []).length;
+            if (!valueAudit.match && valueAudit.gap != null) {
+                const gapStr = Math.abs(valueAudit.gap).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+                detailText += `\n⚠️  Value gap $${gapStr} — ${missingCount} line(s) missing entered value`;
+            } else if (valueAudit.match) {
+                detailText += `\n✅ Line values match shipment total ($${(valueAudit.shipment_total||0).toLocaleString('en-US',{minimumFractionDigits:2})})`;
+            }
+        }
+        document.getElementById('alertSuccessDetail').textContent = detailText;
+        document.getElementById('alertSuccessDetail').style.whiteSpace = 'pre-line';
         show('alertSuccess');
+        renderQualityPanel(valueAudit, lineCount, confidence, healLog);
         document.getElementById('newRunBtn').style.display = 'flex';
         document.getElementById('fileChip').classList.remove('show');
 
@@ -2200,6 +2320,17 @@ function renderRuns() {
                       + '  ·  '
                       + ts.toLocaleTimeString('en-US',{hour:'2-digit',minute:'2-digit'});
         const label   = r.status==='processing' ? 'Running' : r.status==='success' ? 'Success' : 'Failed';
+        const va      = r.value_audit;
+        let valueTag  = '';
+        if (va && r.status === 'success') {
+            if (va.match) {
+                valueTag = `<span class="run-value-ok" title="Line values match shipment total">&#10003; Values OK</span>`;
+            } else if (va.gap != null) {
+                const missCt = (va.missing_value_lines||[]).length;
+                const gapAmt = Math.abs(va.gap).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+                valueTag = `<span class="run-value-warn" title="${missCt} line(s) missing entered value — gap $${gapAmt}">&#9888; $${gapAmt} gap</span>`;
+            }
+        }
         return `<div class="run-item">
             <div>
                 <div class="run-entry">${r.entry_number || '&mdash;'}</div>
@@ -2208,6 +2339,7 @@ function renderRuns() {
                     <span class="run-time">${time}</span>
                     <span class="run-badge ${r.status}">${label}</span>
                     ${r.line_count ? `<span class="run-lines">${r.line_count}&thinsp;lines</span>` : ''}
+                    ${valueTag}
                 </div>
             </div>
             <div class="run-actions">
@@ -2291,6 +2423,144 @@ function formatBytes(b) {
     const k=1024, s=['B','KB','MB'];
     const i=Math.floor(Math.log(b)/Math.log(k));
     return (b/Math.pow(k,i)).toFixed(1)+' '+s[i];
+}
+
+// ── Quality Report ────────────────────────────────────────────────────────
+function computeConfidence(va, lineCount) {
+    if (!va) return { score: null };
+    const total   = lineCount || (va.line_breakdown || []).length || 1;
+    const missing = (va.missing_value_lines || []).length;
+    const stotal  = va.shipment_total || 0;
+    const lsum    = va.line_sum || 0;
+
+    if (va.match) return { score: 100, label:'Match', color:'#16A34A', bg:'#DCFCE7' };
+
+    const coverage = stotal > 0 ? Math.min(1, lsum / stotal) : (missing === 0 ? 1 : 0);
+    let score = Math.round(coverage * 80);
+    score += Math.round(((total - missing) / total) * 20);
+    score = Math.max(0, Math.min(99, score));
+    const label = score >= 90 ? 'Good' : score >= 60 ? 'Partial' : 'Incomplete';
+    const color = score >= 90 ? '#16A34A' : score >= 60 ? '#D97706' : '#DC2626';
+    const bg    = score >= 90 ? '#DCFCE7' : score >= 60 ? '#FEF3C7' : '#FEE2E2';
+    return { score, label, color, bg };
+}
+
+function fmt$(n) {
+    if (n == null) return '—';
+    return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+}
+
+function renderQualityPanel(va, lineCount, confidence, healLog) {
+    const panel = document.getElementById('qualityPanel');
+    if (!va) { panel.style.display = 'none'; return; }
+
+    // Prefer orchestrator's confidence score; fall back to computed
+    const conf = confidence || computeConfidence(va, lineCount);
+    const score = conf.score ?? null;
+    const label = conf.label || 'N/A';
+    const color = conf.color || '#475569';
+    const bg    = conf.bg    || '#F1F5F9';
+    const missing = va.missing_value_lines || [];
+    const SHOW_MAX = 15;
+
+    // Score badge
+    const badge = document.getElementById('qrScoreBadge');
+    badge.textContent = score != null ? `${label}  ${score}%` : 'N/A';
+    badge.style.background = bg;
+    badge.style.color = color;
+
+    // Escalation banner
+    const escalateBanner = document.getElementById('qrEscalateBanner');
+    if (conf.escalate && conf.reasons && conf.reasons.length > 0) {
+        document.getElementById('qrEscalateReasons').textContent = conf.reasons.join('  ·  ');
+        escalateBanner.style.display = 'block';
+    } else {
+        escalateBanner.style.display = 'none';
+    }
+
+    // Healing activity strip
+    const healStrip = document.getElementById('qrHealStrip');
+    const healEvents = (healLog || []).filter(e => e.event === 'gap_recovery' || e.event === 'value_recovery');
+    if (healEvents.length > 0) {
+        const parts = healEvents.map(e => {
+            if (e.event === 'gap_recovery')
+                return `↑ ${e.data.items_recovered || 0} missing item(s) recovered`;
+            if (e.event === 'value_recovery')
+                return `↑ ${e.data.values_filled || 0} value(s) filled`;
+            return '';
+        }).filter(Boolean);
+        document.getElementById('qrHealDetail').textContent = '⚡ Self-healed: ' + parts.join('  ·  ');
+        healStrip.style.display = 'block';
+    } else {
+        healStrip.style.display = 'none';
+    }
+
+    // Value banner
+    const banner = document.getElementById('qrValueBanner');
+    const vd = document.getElementById('qrValueDetail');
+    const vs = document.getElementById('qrValueSub');
+    if (va.match) {
+        banner.style.background = '#F0FDF4';
+        banner.style.borderColor = '#86EFAC';
+        vd.innerHTML = `<span style="color:#16A34A;">&#10003; Values reconcile</span>`;
+        vs.textContent = `All lines sum to ${fmt$(va.shipment_total)}`;
+    } else if (va.gap != null) {
+        const absgap = Math.abs(va.gap);
+        banner.style.background = '#FEF2F2';
+        banner.style.borderColor = '#FCA5A5';
+        vd.innerHTML = `<span style="color:#DC2626;">&#9888; Gap of ${fmt$(absgap)}</span>`;
+        vs.textContent = `Line sum ${fmt$(va.line_sum)} · Shipment total ${fmt$(va.shipment_total)}`;
+    } else {
+        banner.style.background = 'var(--kn-gray-50)';
+        banner.style.borderColor = 'var(--kn-border)';
+        vd.textContent = 'No shipment total to compare';
+        vs.textContent = `Line sum: ${fmt$(va.line_sum)}`;
+    }
+
+    // Sequence gap warning
+    const seqGaps = va.sequence_gaps || [];
+    const gwrap = document.getElementById('qrGapWrap');
+    if (seqGaps.length > 0) {
+        const totalMissing = seqGaps.reduce((s, g) => s + g.count, 0);
+        document.getElementById('qrGapTitle').textContent =
+            `⚠ Agent skipped ${totalMissing} line item${totalMissing !== 1 ? 's' : ''} — extraction incomplete`;
+        document.getElementById('qrGapDetail').textContent =
+            seqGaps.map(g => g.from === g.to ? `Item ${g.from}` : `Items ${g.from}–${g.to}`).join(', ') +
+            ' not found in agent response. Re-run to attempt re-extraction.';
+        gwrap.style.display = 'block';
+    } else {
+        gwrap.style.display = 'none';
+    }
+
+    // Missing lines table (capped at SHOW_MAX rows)
+    const mwrap = document.getElementById('qrMissingWrap');
+    if (missing.length > 0) {
+        document.getElementById('qrMissingTitle').textContent =
+            `${missing.length} line${missing.length !== 1 ? 's' : ''} missing entered value`;
+        const visible = missing.slice(0, SHOW_MAX);
+        document.getElementById('qrMissingBody').innerHTML = visible.map(m => `
+            <tr>
+                <td class="missing">${m.line_number || '—'}</td>
+                <td>${(m.description || '—').substring(0, 50)}${(m.description||'').length > 50 ? '…' : ''}</td>
+                <td>${m.hts_code || '—'}</td>
+            </tr>`).join('');
+        const more = document.getElementById('qrMissingMore');
+        if (missing.length > SHOW_MAX) {
+            more.textContent = `and ${missing.length - SHOW_MAX} more missing lines`;
+            more.style.display = 'block';
+        } else {
+            more.style.display = 'none';
+        }
+        mwrap.style.display = 'block';
+    } else {
+        mwrap.style.display = 'none';
+    }
+
+    panel.style.display = 'block';
+}
+
+function hideQualityPanel() {
+    document.getElementById('qualityPanel').style.display = 'none';
 }
 </script>
 </body>
@@ -2405,6 +2675,177 @@ def validate_and_compare_with_reference(normalized_data: List[Dict]) -> Dict:
         report['errors'].append(f"Validation error: {str(e)}")
     
     return report
+
+
+def audit_line_values(raw_data: Dict) -> Dict:
+    """
+    Post-process agent JSON to identify line items missing ITEM_ENTERED_VALUE.
+    Returns a structured audit report including gap, missing lines, and line-level breakdown.
+    """
+    audit = {
+        'line_sum': 0.0,
+        'shipment_total': None,
+        'gap': None,
+        'match': False,
+        'missing_value_lines': [],   # lines with no entered_value
+        'line_breakdown': [],        # every line with its extracted value (or null)
+        'sequence_gaps': [],         # ranges of item numbers the agent skipped entirely
+    }
+
+    try:
+        # --- 1. Extract line items ---
+        if 'entry_summary' in raw_data and 'line_items' in raw_data.get('entry_summary', {}):
+            items = raw_data['entry_summary']['line_items']
+        elif 'data' in raw_data and 'entry_summary' in raw_data.get('data', {}):
+            items = raw_data['data']['entry_summary'].get('line_items', [])
+        elif 'line_items' in raw_data:
+            items = raw_data['line_items']
+        elif 'items' in raw_data:
+            items = raw_data['items']
+        else:
+            items = []
+
+        # --- 2. Find shipment total ---
+        shipment_total = None
+        # Try agent-reported total_value_check first
+        vr = raw_data.get('validation_results', {})
+        tvc = vr.get('total_value_check', {}) if isinstance(vr, dict) else {}
+        if isinstance(tvc, dict) and tvc.get('shipment_total') is not None:
+            shipment_total = float(tvc['shipment_total'])
+        # Fall back to header total_entered_value
+        if shipment_total is None:
+            for key in ('total_entered_value', 'entered_value_total', 'total_value'):
+                v = raw_data.get(key) or (raw_data.get('entry_summary') or {}).get(key)
+                if v is not None:
+                    try:
+                        shipment_total = float(str(v).replace(',', ''))
+                        break
+                    except (ValueError, TypeError):
+                        pass
+
+        audit['shipment_total'] = shipment_total
+
+        # --- 3. Walk every line item ---
+        line_sum = 0.0
+        for item in items:
+            # Agent returns UPPERCASE keys (ITEM_NUMBER, PRODUCT_DESCRIPTION, ITEM_ENTERED_VALUE)
+            line_no = (item.get('ITEM_NUMBER') or item.get('line_number') or
+                       item.get('line_no') or item.get('line_item_number') or
+                       item.get('item_number') or '')
+            description = (item.get('PRODUCT_DESCRIPTION') or
+                           item.get('description_of_merchandise') or
+                           item.get('description') or item.get('product_description') or '')
+            if isinstance(description, str):
+                description = description[:80]
+
+            # Skip invoice header lines (same logic as normalizer)
+            if isinstance(line_no, str) and line_no.upper().startswith('INV'):
+                continue
+            if isinstance(description, str) and 'Commercial Invoice #:' in description:
+                continue
+
+            # Resolve entered_value — uppercase key first (agent format), then lowercase fallbacks
+            entered_value = None
+            for field in ('ITEM_ENTERED_VALUE', 'entered_value', 'item_entered_value', 'value', 'entered_val'):
+                if item.get(field) is not None:
+                    entered_value = item[field]
+                    break
+            if entered_value is None and isinstance(item.get('primary_hts'), dict):
+                phts = item['primary_hts']
+                for field in ('entered_value', 'value'):
+                    if phts.get(field) is not None:
+                        entered_value = phts[field]
+                        break
+
+            # HTS code — prefer the actual classification code over Chapter 99 fee codes
+            # Chapter 99 (9901.xx – 9999.xx) are special-provision tariffs, not product HTS codes
+            hts_code = ''
+            hts_data_arr = item.get('hts_data', [])
+            if hts_data_arr and isinstance(hts_data_arr, list):
+                candidates = []
+                for hts_entry in hts_data_arr:
+                    code = str(hts_entry.get('HTS_US_CODE') or hts_entry.get('hts_code') or '').strip()
+                    if code:
+                        candidates.append(code)
+                # Prefer non-Chapter-99 code; fall back to first if all are Ch.99
+                for code in candidates:
+                    if not code.startswith('99'):
+                        hts_code = code
+                        break
+                if not hts_code and candidates:
+                    hts_code = candidates[0]
+            if not hts_code:
+                hts_code = (item.get('HTS_US_CODE') or item.get('hts_code') or
+                            item.get('htsus_no') or item.get('hts_us_no') or '')
+            if not hts_code and isinstance(item.get('primary_hts'), dict):
+                hts_code = (item['primary_hts'].get('hts_code') or
+                            item['primary_hts'].get('htsus_no') or '')
+
+            line_entry = {
+                'line_number': str(line_no),
+                'description': description,
+                'hts_code': str(hts_code),
+                'entered_value': None,
+            }
+
+            if entered_value is not None:
+                try:
+                    numeric_val = float(str(entered_value).replace(',', ''))
+                    line_entry['entered_value'] = numeric_val
+                    line_sum += numeric_val
+                except (ValueError, TypeError):
+                    pass  # keep entered_value as None for non-numeric
+
+            audit['line_breakdown'].append(line_entry)
+
+            if line_entry['entered_value'] is None:
+                audit['missing_value_lines'].append({
+                    'line_number': line_entry['line_number'],
+                    'description': line_entry['description'],
+                    'hts_code': line_entry['hts_code'],
+                })
+
+        audit['line_sum'] = round(line_sum, 2)
+
+        # Detect gaps in the numeric item-number sequence (e.g. 001 → 022 means 002-021 missing)
+        numeric_nos = sorted(
+            int(b['line_number']) for b in audit['line_breakdown']
+            if b['line_number'].isdigit()
+        )
+        if len(numeric_nos) >= 2:
+            gaps = []
+            for i in range(len(numeric_nos) - 1):
+                a, b_val = numeric_nos[i], numeric_nos[i + 1]
+                if b_val - a > 1:
+                    gaps.append({'from': a + 1, 'to': b_val - 1, 'count': b_val - a - 1})
+            if gaps:
+                audit['sequence_gaps'] = gaps
+                total_gap_lines = sum(g['count'] for g in gaps)
+                print(f"   ⚠️  Sequence gaps detected: {gaps} ({total_gap_lines} missing item numbers)")
+
+        # Cross-reference against agent's own validation_results.total_value_check
+        if isinstance(tvc, dict) and tvc.get('line_sum') is not None:
+            agent_line_sum = float(tvc['line_sum'])
+            audit['agent_line_sum'] = agent_line_sum
+            # If our walk got 0 but agent got something, use agent's sum for display
+            if line_sum == 0.0 and agent_line_sum > 0:
+                audit['line_sum'] = agent_line_sum
+
+        if shipment_total is not None:
+            gap = round(shipment_total - audit['line_sum'], 2)
+            audit['gap'] = gap
+            audit['match'] = abs(gap) < 0.02  # allow $0.01 rounding
+
+        print(f"\n   💰 Value Audit: line_sum={audit['line_sum']}, "
+              f"agent_line_sum={audit.get('agent_line_sum')}, "
+              f"shipment_total={shipment_total}, gap={audit.get('gap')}, "
+              f"missing_lines={len(audit['missing_value_lines'])}")
+
+    except Exception as e:
+        audit['error'] = str(e)
+        print(f"   ⚠️  Value audit error: {e}")
+
+    return audit
 
 
 @app.route('/fetch-by-runid', methods=['POST'])
@@ -2723,57 +3164,91 @@ def process_json():
 
 def process_single_pdf(filepath: str, filename: str) -> Dict[str, Any]:
     """
-    Process a single PDF file and return both original and normalized data
-    Returns dict with 'success', 'filename', 'raw_a79_data', 'extracted_data', 'normalized_data', 'error' keys
+    Process a single PDF file through the self-healing orchestration pipeline.
+
+    When CLAUDE_API_KEY is set and SELF_HEALING is not disabled:
+      A79 extraction → Claude gap/value recovery → confidence scoring
+
+    Falls back to direct A79 extraction when self-healing is unavailable.
     """
     try:
         logger.info(f"Processing PDF: {filename}")
-        
-        # Process document with API - returns parsed data with _raw_a79_response attached
+
+        use_healing = SELF_HEALING_ENABLED and bool(CLAUDE_API_KEY)
+
+        if use_healing:
+            logger.info("Self-healing pipeline active")
+            orch = SelfHealingOrchestrator(
+                a79_api_key=API_KEY,
+                a79_url=API_BASE_URL,
+                a79_agent_name=API1_AGENT_NAME,
+                a79_agent_id=API1_AGENT_ID,
+                a79_custom_instructions=API1_CUSTOM_INSTRUCTIONS,
+                claude_api_key=CLAUDE_API_KEY,
+                claude_model=CLAUDE_MODEL,
+            )
+            result = orch.run(
+                filepath, filename,
+                call_api_fn=call_api,
+                parse_fn=parse_ai79_response,
+                audit_fn=audit_line_values,
+                normalizer_cls=CBP7501Normalizer,
+            )
+            # Validate column structure (additive — doesn't change result)
+            result['validation'] = validate_and_compare_with_reference(result['normalized_data'])
+            # Save output JSON
+            _save_output_json(filepath, filename, result['raw_a79_data'], result['value_audit'])
+            return result
+
+        # ── Fallback: direct A79 (no healing) ────────────────────────────────
+        logger.info("Self-healing disabled or CLAUDE_API_KEY not set — direct A79 extraction")
         extracted_data = process_document_with_api(filepath, filename)
-        
-        # Extract raw A79 response if attached
-        raw_a79_response = extracted_data.pop('_raw_a79_response', None)
-        
-        # If not attached, try to load from debug file
-        if raw_a79_response is None:
-            debug_file = filepath.replace('.pdf', '_api1_response.json')
-            if os.path.exists(debug_file):
-                try:
-                    with open(debug_file, 'r') as f:
-                        raw_a79_response = json.load(f)
-                    logger.info(f"Loaded raw A79 response from {debug_file}")
-                except Exception as e:
-                    logger.warning(f"Could not load raw response: {e}")
-        
-        # If still no raw response, use extracted_data (which is parsed)
-        if raw_a79_response is None:
-            raw_a79_response = extracted_data
-        
-        # Normalize data
+        raw_a79_response = extracted_data.pop('_raw_a79_response', None) or extracted_data
+
         normalizer = CBP7501Normalizer()
         normalized_data = normalizer.normalize(extracted_data)
-        
-        # Validate
         validation_report = validate_and_compare_with_reference(normalized_data)
-        
+        value_audit = audit_line_values(raw_a79_response)
+
+        _save_output_json(filepath, filename, raw_a79_response, value_audit)
+
         return {
             'success': True,
             'filename': filename,
-            'raw_a79_data': raw_a79_response,  # Raw A79 response with all header data
-            'extracted_data': extracted_data,  # Parsed structure
-            'normalized_data': normalized_data,  # Flattened structure for Excel-like export
+            'raw_a79_data': raw_a79_response,
+            'extracted_data': extracted_data,
+            'normalized_data': normalized_data,
             'validation': validation_report,
-            'row_count': len(normalized_data)
+            'value_audit': value_audit,
+            'row_count': len(normalized_data),
+            'confidence': None,
+            'heal_log': [],
         }
+
     except Exception as e:
         logger.error(f"Error processing {filename}: {str(e)}")
         return {
             'success': False,
             'filename': filename,
             'error': str(e),
-            'data': None
+            'data': None,
         }
+
+
+def _save_output_json(filepath: str, filename: str, raw_data: dict, value_audit: dict):
+    """Persist the enriched JSON to OUTPUT_FOLDER for later download / audit."""
+    try:
+        import uuid, re as _re
+        safe = _re.sub(r'[^\w\-.]', '_', filename.replace('.pdf', ''))
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        out_path = os.path.join(OUTPUT_FOLDER, f"cbp7501_{safe}_{ts}.json")
+        output = dict(raw_data)
+        output['_value_audit'] = value_audit
+        with open(out_path, 'w', encoding='utf-8') as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+        logger.info(f"Output JSON saved: {out_path}")
+    except Exception as exc:
+        logger.warning(f"Could not save output JSON: {exc}")
 
 
 @app.route('/upload', methods=['POST'])
@@ -2861,14 +3336,16 @@ def upload_file():
             output_path = os.path.join(OUTPUT_FOLDER, output_filename)
             
             normalizer = CBP7501Normalizer()
-            # Pass raw_a79_data (unparsed) to preserve all header fields exactly as A79 returns
             normalizer.to_json(
-                result.get('normalized_data', []), 
-                output_path, 
+                result.get('normalized_data', []),
+                output_path,
                 extracted_data=result.get('extracted_data'),
-                raw_a79_data=result.get('raw_a79_data')
+                raw_a79_data=result.get('raw_a79_data'),
+                value_audit=result.get('value_audit'),
+                confidence=result.get('confidence'),
+                heal_log=result.get('heal_log'),
             )
-            
+
             print(f"\n{'='*80}")
             print(f"✅ PROCESSING COMPLETE")
             print(f"{'='*80}")
@@ -2898,12 +3375,14 @@ def upload_file():
                         json_path = os.path.join(OUTPUT_FOLDER, json_filename)
                         
                         normalizer = CBP7501Normalizer()
-                        # Pass raw_a79_data (unparsed) to preserve all header fields exactly as A79 returns
                         normalizer.to_json(
-                            result.get('normalized_data', []), 
+                            result.get('normalized_data', []),
                             json_path,
                             extracted_data=result.get('extracted_data'),
-                            raw_a79_data=result.get('raw_a79_data')
+                            raw_a79_data=result.get('raw_a79_data'),
+                            value_audit=result.get('value_audit'),
+                            confidence=result.get('confidence'),
+                            heal_log=result.get('heal_log'),
                         )
                         
                         zipf.write(json_path, json_filename)
