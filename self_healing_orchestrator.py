@@ -21,10 +21,12 @@ from typing import Any, Dict, List, Optional
 
 import requests
 
+from validator_7501 import validate_extraction
+
 logger = logging.getLogger(__name__)
 
 # ── Tuning constants ──────────────────────────────────────────────────────────
-MAX_HEAL_ROUNDS = 2           # maximum Claude healing passes
+MAX_HEAL_ROUNDS = 3           # verify → repair passes (per self-healing spec)
 ESCALATE_THRESHOLD = 88       # confidence % below which we flag for human review
 MISSING_VAL_BATCH = 30        # max missing-value lines sent to Claude per call
 GAP_ITEM_BATCH = 40           # max missing item numbers recovered per Claude call
@@ -51,6 +53,7 @@ class SelfHealingOrchestrator:
         a79_custom_instructions: str,
         claude_api_key: str,
         claude_model: str,
+        self_healing_instructions: str = "",
     ):
         self.a79_api_key = a79_api_key
         self.a79_url = a79_url
@@ -59,6 +62,7 @@ class SelfHealingOrchestrator:
         self.a79_custom_instructions = a79_custom_instructions
         self.claude_api_key = claude_api_key
         self.claude_model = claude_model
+        self.self_healing_instructions = self_healing_instructions or ""
         self.heal_log: List[Dict] = []
 
     # ── Public entry point ────────────────────────────────────────────────────
@@ -99,27 +103,32 @@ class SelfHealingOrchestrator:
             agent_id=self.a79_agent_id,
         )
         raw = parse_fn(raw)
-
-        # ── Step 2: initial validation ────────────────────────────────────────
-        print("\n   [2/4] Validating extraction...")
-        audit = audit_fn(raw)
         self._log("primary_extraction", {
             "item_count": len(raw.get("line_items", [])),
-            "sequence_gaps": audit.get("sequence_gaps", []),
-            "missing_value_count": len(audit.get("missing_value_lines", [])),
-            "line_sum": audit.get("line_sum"),
-            "shipment_total": audit.get("shipment_total"),
-            "gap": audit.get("gap"),
+        })
+
+        # ── Step 2: initial validation + deterministic verify ─────────────────
+        print("\n   [2/4] Validating extraction...")
+        audit = audit_fn(raw)
+        verification = validate_extraction(raw)
+        audit["verification"] = verification
+        self._log("primary_verification", {
+            "status": verification["status"],
+            "line_failures": len(verification.get("line_failures", [])),
+            "blocking_gates": verification.get("blocking_gates", []),
         })
         self._print_audit_summary(audit, "Initial")
+        self._print_verification_summary(verification, "Initial")
 
-        # ── Step 3: healing rounds ────────────────────────────────────────────
+        # ── Step 3: healing rounds (gap/value recovery + surgical repair) ───
         print(f"\n   [3/4] Self-healing (up to {MAX_HEAL_ROUNDS} rounds)...")
         for round_num in range(1, MAX_HEAL_ROUNDS + 1):
             gaps = audit.get("sequence_gaps", [])
             missing_vals = audit.get("missing_value_lines", [])
+            line_failures = verification.get("line_failures", [])
+            status = verification.get("status", "GREEN")
 
-            if not gaps and not missing_vals:
+            if not gaps and not missing_vals and status in ("GREEN", "YELLOW"):
                 print(f"      ✅ Nothing to heal after round {round_num - 1}")
                 break
 
@@ -140,7 +149,7 @@ class SelfHealingOrchestrator:
                     })
 
             # 3b. Fill missing ITEM_ENTERED_VALUE fields
-            missing_vals = audit.get("missing_value_lines", [])  # re-read after gap heal
+            missing_vals = audit.get("missing_value_lines", [])
             if missing_vals and self.claude_api_key:
                 filled = self._heal_values(pdf_bytes, raw, missing_vals)
                 if filled:
@@ -153,20 +162,36 @@ class SelfHealingOrchestrator:
                         "filled_items": filled,
                     })
 
+            # 3c. Surgical repair for validator-flagged lines
+            if line_failures and status == "RED" and self.claude_api_key:
+                repaired = self._heal_line_failures(pdf_bytes, raw, line_failures)
+                if repaired:
+                    raw = self._merge_repaired_items(raw, repaired)
+                    healed_anything = True
+                    self._log("line_repair", {
+                        "round": round_num,
+                        "lines_targeted": len(line_failures),
+                        "lines_repaired": len(repaired),
+                        "repaired_numbers": [i.get("ITEM_NUMBER") for i in repaired],
+                    })
+
             if not healed_anything:
                 print(f"      ⚠️  Claude could not recover additional data in round {round_num}")
                 break
 
             # Re-validate
             audit = audit_fn(raw)
+            verification = validate_extraction(raw)
+            audit["verification"] = verification
             self._print_audit_summary(audit, f"After round {round_num}")
+            self._print_verification_summary(verification, f"After round {round_num}")
 
         # ── Step 4: normalize + score ─────────────────────────────────────────
         print("\n   [4/4] Normalizing and scoring...")
         normalizer = normalizer_cls()
         normalized_data = normalizer.normalize(raw)
 
-        confidence = self._score_confidence(audit, raw)
+        confidence = self._score_confidence(audit, raw, verification)
         audit["confidence"] = confidence
         audit["heal_log"] = self.heal_log
 
@@ -183,6 +208,110 @@ class SelfHealingOrchestrator:
             "confidence": confidence,
             "heal_log": self.heal_log,
         }
+
+    # ── Line integrity repair ─────────────────────────────────────────────────
+
+    def _heal_line_failures(self, pdf_bytes: bytes, raw: dict, line_failures: list) -> list:
+        """Surgical repair pass for lines that failed deterministic validator gates."""
+        batch = line_failures[:MISSING_VAL_BATCH]
+        if not batch:
+            return []
+
+        print(f"      🔧 Line repair: asking Claude to fix {len(batch)} failing line(s)...")
+
+        items_by_num = {
+            str(i.get("ITEM_NUMBER", "")).strip().zfill(3): i
+            for i in raw.get("line_items", [])
+            if str(i.get("ITEM_NUMBER", "")).strip()
+        }
+
+        blocks = []
+        for lf in batch:
+            num = lf["item_number"]
+            item = items_by_num.get(num, {})
+            blocks.append(
+                f"--- LINE {num} ---\n"
+                f"failed_checks: {json.dumps(lf['failed_checks'])}\n"
+                f"current_extraction:\n{json.dumps(item, indent=2)}"
+            )
+
+        repair_rules = (
+            "Apply these rules (the ones relevant to the failures):\n"
+            "- STACKED HTS: Chapter-99 codes (9903.xx.xx) first, product classification "
+            "(Ch 1-97) LAST. Every code is its own hts_data row. Product code is NEVER PART_NUMBER.\n"
+            "- PART_NUMBER: only a printed style/SKU; if none printed, return null. "
+            "A code shaped NNNN.NN.NNNN is an HTS code, not a part number.\n"
+            "- ENTERED VALUE: the integer in the Entered Value column. "
+            "It MUST satisfy EV × rate = printed duty for every percentage row.\n"
+        )
+
+        system = (
+            "You are a CBP Form 7501 customs entry extraction specialist performing a "
+            "surgical repair pass. Return ONLY valid JSON — no explanatory text."
+        )
+
+        user_content = [
+            {
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": base64.b64encode(pdf_bytes).decode("utf-8"),
+                },
+            },
+            {
+                "type": "text",
+                "text": (
+                    "You previously extracted line(s) from a CBP 7501 entry. A deterministic "
+                    "check found specific errors. Re-extract ONLY the line(s) below, fixing "
+                    "exactly the named errors.\n\n"
+                    f"{repair_rules}\n"
+                    + "\n\n".join(blocks)
+                    + "\n\nReturn corrected JSON for ONLY these line(s) as a JSON array, "
+                    "same schema, with recomputed _confidence."
+                ),
+            },
+        ]
+
+        try:
+            text = self._call_claude(system, user_content)
+            items = self._extract_json(text)
+            if not isinstance(items, list):
+                items = [items]
+
+            wanted = {lf["item_number"] for lf in batch}
+            valid = []
+            for item in items:
+                num = str(item.get("ITEM_NUMBER", "")).strip().zfill(3)
+                if num in wanted:
+                    item["ITEM_NUMBER"] = num
+                    item["_healed_by"] = "claude_line_repair"
+                    valid.append(item)
+
+            print(f"      ✅ Line repair: Claude corrected {len(valid)}/{len(batch)} line(s)")
+            return valid
+
+        except Exception as exc:
+            print(f"      ⚠️  Line repair failed: {exc}")
+            self._log("line_repair_error", {"error": str(exc)})
+            return []
+
+    def _merge_repaired_items(self, raw: dict, repaired_items: list) -> dict:
+        """Replace line items by ITEM_NUMBER with repaired versions."""
+        if not repaired_items:
+            return raw
+
+        by_num = {
+            str(i.get("ITEM_NUMBER", "")).strip().zfill(3): i
+            for i in repaired_items
+        }
+        merged = []
+        for item in raw.get("line_items", []):
+            num = str(item.get("ITEM_NUMBER", "")).strip().zfill(3)
+            merged.append(by_num.pop(num, item))
+        result = dict(raw)
+        result["line_items"] = merged
+        return result
 
     # ── Claude ────────────────────────────────────────────────────────────────
 
@@ -448,7 +577,7 @@ Rules:
 
     # ── Confidence scoring ────────────────────────────────────────────────────
 
-    def _score_confidence(self, audit: dict, raw: dict) -> dict:
+    def _score_confidence(self, audit: dict, raw: dict, verification: Optional[dict] = None) -> dict:
         """
         Multi-dimensional confidence score (0–100).
 
@@ -503,6 +632,10 @@ Rules:
 
         total_score = seq_score + val_score + sum_score
 
+        # Penalize RED verification status
+        if verification and verification.get("status") == "RED":
+            total_score = min(total_score, ESCALATE_THRESHOLD - 1)
+
         # Escalation decision
         escalate = total_score < ESCALATE_THRESHOLD
         reasons = []
@@ -514,6 +647,9 @@ Rules:
             reasons.append(f"{missing_count} items ({pct}%) still missing entered value")
         if audit.get("gap") and abs(audit["gap"]) > 0.01:
             reasons.append(f"${abs(audit['gap']):,.2f} gap vs shipment total")
+
+        if verification and verification.get("status") == "RED":
+            reasons.append(f"Verification status RED ({len(verification.get('line_failures', []))} failing lines)")
 
         label = "High" if total_score >= 90 else "Medium" if total_score >= 70 else "Low"
         color = "#16A34A" if total_score >= 90 else "#D97706" if total_score >= 70 else "#DC2626"
@@ -534,6 +670,7 @@ Rules:
             "reasons": reasons,
             "breakdown": breakdown,
             "healed_items": healed_items,
+            "verification_status": (verification or {}).get("status"),
         }
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -547,6 +684,19 @@ Rules:
         for g in gaps:
             parts.append(f"{g['from']}–{g['to']}" if g["from"] != g["to"] else str(g["from"]))
         return ", ".join(parts)
+
+    @staticmethod
+    def _print_verification_summary(verification: dict, label: str):
+        status = verification.get("status", "?")
+        failures = len(verification.get("line_failures", []))
+        blocking = verification.get("blocking_gates", [])
+        mean = verification.get("mean_line_score")
+        mean_str = f"{mean:.3f}" if mean is not None else "n/a"
+        block_str = f"  |  blocking: {', '.join(blocking)}" if blocking else ""
+        print(
+            f"      🔍 {label} verify: status={status}  |  "
+            f"{failures} line failure(s)  |  mean_score={mean_str}{block_str}"
+        )
 
     @staticmethod
     def _print_audit_summary(audit: dict, label: str):

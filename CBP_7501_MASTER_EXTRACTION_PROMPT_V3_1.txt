@@ -1,4 +1,4 @@
-# CBP Form 7501 Master Extraction Prompt v2
+`# CBP Form 7501 Master Extraction Prompt v2
 ## Comprehensive System for All Brokers
 ## Enhanced with Validation Rules & Edge Case Handling
 
@@ -1236,6 +1236,21 @@ Note: Only sum items with actual values (skip null/continuation items)
 Tolerance: ±$1.00 for rounding
 ```
 
+### 11.2.1 Duty-Rate Cross-Check (Line-Level Self-Verification)
+
+For each line item that has a **percentage-based HTS rate** (e.g., "15%", "7.5%", "25%"):
+
+1. After extracting ITEM_ENTERED_VALUE, compute: `expected_duty = ITEM_ENTERED_VALUE × rate`
+2. Compare to the DUTY_AND_TAXES value extracted for that same HTS entry
+3. If `|expected_duty - DUTY_AND_TAXES| > $1.00`, the entered value was mis-read — re-examine the VALUE column **on that line's horizontal band** and correct ITEM_ENTERED_VALUE
+4. Use `correct_EV = DUTY_AND_TAXES ÷ rate` as a verification guide, NOT as a substitute for reading the form
+5. **NEVER use Box 35 (TOTAL_ENTERED_VALUE) to fill an individual line's ITEM_ENTERED_VALUE**
+
+Example (correct):
+- Line 002: duty=$10.20 at 15% → expected EV = $10.20 ÷ 0.15 = $68.00
+- If extracted EV=$11.28: $11.28 × 15% = $1.69 ≠ $10.20 → MISMATCH → re-read value column → find $68.00
+
+
 ## 11.3 Totals Validation
 
 ```
@@ -1348,6 +1363,8 @@ Action:
 ✓ Exclude container breakdown lines (no value, no duty)
 ✓ Flag MPF anomalies (> $538.40 for single entry)
 ✓ Document excluded items in metadata
+✓ Read each line item's entered value from the VALUE column on the same horizontal band as that line's ITEM_NUMBER — do not read entered values from adjacent lines
+✓ Verify HTS codes are in XXXX.XX.XXXX or XXXX.XX format — entered value dollar amounts are NOT HTS codes
 
 ## 12.2 DON'Ts
 
@@ -1373,6 +1390,10 @@ Action:
 ✗ DO NOT count container breakdowns as valid line items
 ✗ DO NOT include lines with HTS rate "N/A" and no values
 ✗ DO NOT include "SAID TO CONTAIN" manifest descriptions
+✗ DO NOT store dollar amounts (e.g. $4,265.19, $68.00, $156.00) in HTS_US_CODE — the entered value column on the form is NOT the HTS column
+✗ DO NOT store fee codes (499 MPF, 501 HMF, 056, 110) as a plain string in HTS_US_CODE — follow Section 8.3 fee-handling format with `_is_fee: true`; valid HTS codes have 4+ digit chapter headings before the first period
+✗ DO NOT read data from one line's horizontal band and attribute it to a different line number — every field for line N must come from line N's row on the form
+✗ DO NOT let interstitial text (invoice labels, tariff labels, section headers printed between numbered lines) carry over into the description, HTS, or value fields of the adjacent numbered lines
 
 ---
 
@@ -1681,7 +1702,47 @@ Before deployment, verify:
 
 ---
 
+## 16.3 Reciprocal Tariff Entry with Multiple COO Lines — Correct Entered Value Per Line
+
+**Scenario:** A 7501 has 3 lines, all with HTS 8422.90.9195 (FREE rate), plus Section 232 reciprocal tariff 9903.02.20 at 15%. Lines split by country of origin: Line 001 from Italy (OIT), Lines 002–003 from Spain (OES). Each line has its own entered value printed in the value column.
+
+**Incorrect extraction (DO NOT do this):**
+```json
+{"ITEM_NUMBER": "001", "ITEM_ENTERED_VALUE": 4489, ...},   // ← using shipment TOTAL, not line value
+{"ITEM_NUMBER": "002", "ITEM_ENTERED_VALUE": 0, ...},
+{"ITEM_NUMBER": "003", "ITEM_ENTERED_VALUE": 0, ...}
+```
+
+**Correct extraction:**
+```json
+{"ITEM_NUMBER": "001", "ITEM_ENTERED_VALUE": 4265, "COUNTRY_OF_ORIGIN": "IT",
+  "hts_data": [
+    {"HTS_US_CODE": "9903.02.20", "HTSUS_RATE": "15%", "DUTY_AND_TAXES": 639.75},
+    {"HTS_US_CODE": "8422.90.9195", "HTSUS_RATE": "FREE", "DUTY_AND_TAXES": 0}
+  ]},
+{"ITEM_NUMBER": "002", "ITEM_ENTERED_VALUE": 68, "COUNTRY_OF_ORIGIN": "ES",
+  "hts_data": [
+    {"HTS_US_CODE": "9903.02.20", "HTSUS_RATE": "15%", "DUTY_AND_TAXES": 10.20},
+    {"HTS_US_CODE": "8422.90.9195", "HTSUS_RATE": "FREE", "DUTY_AND_TAXES": 0}
+  ]},
+{"ITEM_NUMBER": "003", "ITEM_ENTERED_VALUE": 156, "COUNTRY_OF_ORIGIN": "ES",
+  "hts_data": [
+    {"HTS_US_CODE": "9903.02.20", "HTSUS_RATE": "15%", "DUTY_AND_TAXES": 23.40},
+    {"HTS_US_CODE": "8422.90.9195", "HTSUS_RATE": "FREE", "DUTY_AND_TAXES": 0}
+  ]}
+```
+
+**Key rules demonstrated:**
+- Each line has its own entered value — read it from the VALUE column on that line's row
+- TOTAL_ENTERED_VALUE ($4,489) is Box 35 — the shipment total — never assign it to a single line
+- Verify: ITEM_ENTERED_VALUE × rate = DUTY_AND_TAXES ($4,265 × 15% = $639.75; $68 × 15% = $10.20; $156 × 15% = $23.40)
+- Dollar amounts ($4,265.19, $68.00, $155.95) from the form go into ITEM_ENTERED_VALUE, NOT into HTS_US_CODE or PRODUCT_DESCRIPTION
+- The FREE-rate HTS (8422.90.9195) is always present but contributes $0 duty — the 15% reciprocal tariff (9903.02.20) is where all duty comes from
+
+---
+
 *Master Prompt Version 3.0*
 *Enhanced with single-line entry handling, MPF anomaly detection, and strict data filtering*
 *Covers: GEODIS, BDP, KIS, EFP, CH Robinson, Expeditors, DHL, UPS, Kuehne+Nagel, FedEx*
 *Form Versions: 7/21, 2/18, 5/22, 10/25*
+`

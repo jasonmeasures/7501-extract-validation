@@ -8,7 +8,7 @@ echo "🔧 REBUILDING CBP 7501 FLASK APPLICATION"
 echo "═══════════════════════════════════════════════════════════════════════════════"
 echo ""
 
-cd "/Users/jasonmeasures/Library/CloudStorage/OneDrive-KlearNow/VS Scripts/Clear Audit 7501"
+cd "$(dirname "$0")"
 
 # Step 1: Kill any running processes
 echo "1️⃣  Stopping any running processes..."
@@ -16,11 +16,15 @@ lsof -ti:5002 | xargs kill -9 2>/dev/null || echo "   ✅ No processes on port 5
 pkill -f "app_v3.5.10.py" 2>/dev/null || echo "   ✅ No app processes found"
 sleep 2
 
-# Step 2: Backup existing venv if it exists
+# Step 2: Remove old venv backups and existing venv
+echo ""
+echo "2️⃣  Removing old virtual environments..."
+rm -rf venv.backup.* 2>/dev/null || true
 if [ -d "venv" ]; then
-    echo ""
-    echo "2️⃣  Backing up existing virtual environment..."
-    mv venv venv.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || echo "   ⚠️  Could not backup venv"
+    rm -rf venv
+    echo "   ✅ Removed existing venv"
+else
+    echo "   ✅ No existing venv"
 fi
 
 # Step 3: Create new virtual environment
@@ -58,10 +62,12 @@ python -c "import openpyxl; print(f'   ✅ openpyxl {openpyxl.__version__}')" ||
 
 # Step 7: Create required directories
 echo ""
-echo "7️⃣  Creating required directories..."
+echo "7️⃣  Creating required directories and clearing logs..."
 mkdir -p /tmp/cbp_uploads
 mkdir -p /tmp/cbp_outputs
-echo "   ✅ Directories created"
+: > /tmp/cbp_debug.log 2>/dev/null || true
+rm -f /tmp/cbp_uploads/* /tmp/cbp_outputs/* 2>/dev/null || true
+echo "   ✅ Directories created, logs cleared"
 
 # Step 8: Test app import
 echo ""

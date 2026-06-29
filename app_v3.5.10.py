@@ -16,19 +16,27 @@ from self_healing_orchestrator import SelfHealingOrchestrator
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 
-# Configure detailed logging
+# Environment: development | playground | production
+APP_ENV = os.environ.get('APP_ENV', 'development').lower()
+PLAYGROUND = APP_ENV in ('playground', 'production', 'prod')
+LOG_LEVEL = getattr(logging, os.environ.get('LOG_LEVEL', 'INFO' if PLAYGROUND else 'DEBUG').upper(), logging.INFO)
+
+# Configure logging — verbose file logging only in development
+_log_handlers = [logging.StreamHandler()]
+if not PLAYGROUND:
+    _log_handlers.append(logging.FileHandler('/tmp/cbp_debug.log'))
+else:
+    # Fresh log file for playground runs
+    open('/tmp/cbp_debug.log', 'w').close()
+    _log_handlers.append(logging.FileHandler('/tmp/cbp_debug.log'))
+
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=LOG_LEVEL,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler('/tmp/cbp_debug.log')
-    ]
+    handlers=_log_handlers,
 )
 logger = logging.getLogger(__name__)
-
-# Enable Flask debug logging
-app.logger.setLevel(logging.DEBUG)
+app.logger.setLevel(LOG_LEVEL)
 
 # API Configuration - Unified endpoint for both page processing
 # Load API key from environment variable for security
@@ -45,9 +53,13 @@ API1_WORKFLOW_ID = None
 
 
 # Custom instructions for API 1 — loaded from prompt file
-_prompt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CBP_7501_MASTER_EXTRACTION_PROMPT_V3_1.txt")
+_base_dir = os.path.dirname(os.path.abspath(__file__))
+_prompt_file = os.path.join(_base_dir, "universal-7501-extraction-prompt.md")
+_self_healing_prompt_file = os.path.join(_base_dir, "self-healing-7501-agent.md")
 with open(_prompt_file, "r") as _f:
     API1_CUSTOM_INSTRUCTIONS = _f.read()
+with open(_self_healing_prompt_file, "r") as _f:
+    SELF_HEALING_AGENT_INSTRUCTIONS = _f.read()
 
 # API 2 - Not currently used (kept for reference)
 # API2_AGENT_NAME = "Process Document Compressed"
@@ -425,17 +437,90 @@ class CBP7501Normalizer:
         
         return mapped
     
+    def _flatten_entry_for_header(self, raw_json: Dict) -> Dict:
+        """
+        Normalize universal U1.0 response shape (shipment + addresses blocks)
+        into flat entry fields the header mapper understands.
+        """
+        if 'entry_summary' in raw_json:
+            entry = dict(raw_json['entry_summary'])
+        elif 'data' in raw_json and 'entry_summary' in raw_json.get('data', {}):
+            entry = dict(raw_json['data']['entry_summary'])
+        else:
+            entry = dict(raw_json)
+
+        shipment = entry.get('shipment') or raw_json.get('shipment') or {}
+        if isinstance(shipment, dict):
+            upper_map = {
+                'ENTRY_NUMBER': 'entry_number',
+                'FILER_CODE': 'filer_code',
+                'ENTRY_TYPE': 'entry_type',
+                'SUMMARY_DATE': 'summary_date',
+                'SURETY_NUMBER': 'surety_number',
+                'BOND_TYPE': 'bond_type',
+                'PORT_OF_ENTRY': 'port_of_entry',
+                'ENTRY_DATE': 'entry_date',
+                'MODE_OF_TRANSPORT': 'mode_of_transport',
+                'COUNTRY_OF_ORIGIN': 'country_of_origin',
+                'IMPORT_DATE': 'import_date',
+                'BOL_NUMBER': 'master_bol_number',
+                'MANUFACTURER_ID': 'manufacturer_id_header',
+                'EXPORT_COUNTRY': 'export_country',
+                'EXPORT_DATE': 'export_date',
+                'PORT_OF_LADING': 'port_of_lading',
+                'PORT_OF_UNLADING': 'port_of_unlading',
+                'LOCATION_FIRMS_CODE': 'location_firms_code',
+                'CONSIGNEE_ID': 'consignee_id',
+                'IMPORTER_ID': 'importer_id',
+                'REF_NUMBER': 'ref_number',
+                'TOTAL_ENTERED_VALUE': 'total_entered_value',
+                'TOTALS_DUTY': 'totals_duty',
+                'TOTALS_TAX': 'totals_tax',
+                'TOTAL_OTHER_FEES': 'total_other_fees',
+                'DUTY_GRAND_TOTAL': 'duty_grand_total',
+                'DECLARANT_NAME': 'declarant_name',
+                'BROKER_CODE': 'broker_code',
+                'MPF_AMOUNT': 'mpf_amount',
+                'COTTON_AMOUNT': 'cotton_amount',
+            }
+            for upper, lower in upper_map.items():
+                if upper in shipment and lower not in entry:
+                    entry[lower] = shipment[upper]
+
+        addresses = entry.get('addresses') or raw_json.get('addresses') or {}
+        if isinstance(addresses, dict):
+            def _party_name(party: str):
+                block = addresses.get(party) or addresses.get(party.lower()) or {}
+                if isinstance(block, dict):
+                    return block.get('NAME') or block.get('name')
+                return block if isinstance(block, str) else None
+
+            importer_name = _party_name('IMPORTER')
+            consignee_name = _party_name('CONSIGNEE')
+            broker_name = _party_name('BROKER')
+
+            consignee_id = entry.get('consignee_id') or (
+                shipment.get('CONSIGNEE_ID') if isinstance(shipment, dict) else None
+            )
+            if consignee_name and str(consignee_name).upper() == 'SAME AS IMPORTER':
+                consignee_name = importer_name or 'SAME AS IMPORTER'
+            elif consignee_id == 'SAME':
+                consignee_name = importer_name or 'SAME AS IMPORTER'
+
+            if consignee_name and not entry.get('consignee_name'):
+                entry['consignee_name'] = consignee_name
+            if importer_name and not entry.get('importer_name'):
+                entry['importer_name'] = importer_name
+            if broker_name and not entry.get('broker_name'):
+                entry['broker_name'] = broker_name
+
+        return entry
+
     def _extract_header_data(self, raw_json: Dict) -> Dict:
         """Extract header-level data from raw JSON"""
         data = {}
         
-        # Navigate to entry_summary (handle different response structures)
-        if 'entry_summary' in raw_json:
-            entry = raw_json['entry_summary']
-        elif 'data' in raw_json and 'entry_summary' in raw_json['data']:
-            entry = raw_json['data']['entry_summary']
-        else:
-            entry = raw_json
+        entry = self._flatten_entry_for_header(raw_json)
         
         # Check for invoice header lines in items and extract invoice number
         invoice_number = None
@@ -1250,21 +1335,23 @@ def process_document_with_api(filepath, filename):
             agent_id=API1_AGENT_ID
         )
         
-        # Save raw response
-        debug_file = filepath.replace('.pdf', '_api1_response.json')
-        with open(debug_file, 'w') as f:
-            json.dump(raw_a79_response, f, indent=2)
-        print(f"      ✅ Raw response saved: {debug_file}")
+        # Save raw response (development only — skip in playground)
+        if not PLAYGROUND:
+            debug_file = filepath.replace('.pdf', '_api1_response.json')
+            with open(debug_file, 'w') as f:
+                json.dump(raw_a79_response, f, indent=2)
+            print(f"      ✅ Raw response saved: {debug_file}")
         
         # Parse the AI79 page-based response format
         print(f"\n   🔄 Parsing AI79 response format...")
         parsed_data = parse_ai79_response(raw_a79_response)
         
-        # Save parsed response
-        parsed_file = filepath.replace('.pdf', '_parsed_response.json')
-        with open(parsed_file, 'w') as f:
-            json.dump(parsed_data, f, indent=2)
-        print(f"      ✅ Parsed response saved: {parsed_file}")
+        # Save parsed response (development only)
+        if not PLAYGROUND:
+            parsed_file = filepath.replace('.pdf', '_parsed_response.json')
+            with open(parsed_file, 'w') as f:
+                json.dump(parsed_data, f, indent=2)
+            print(f"      ✅ Parsed response saved: {parsed_file}")
         
         # Return both raw and parsed - store raw in a way that can be accessed
         # Attach raw response to parsed data for later retrieval
@@ -1602,6 +1689,12 @@ def index():
             --kn-radius-lg:     12px;
             --kn-shadow:        0 1px 3px rgba(0,0,0,.08), 0 1px 2px rgba(0,0,0,.05);
             --kn-shadow-md:     0 4px 6px -1px rgba(0,0,0,.08);
+            /* Inditex-inspired semantic palette */
+            --mg-50:  #FDF4E5; --mg-100:#FCE8C3; --mg-500:#F69000; --mg-700:#B06604;
+            --sp-50:  #E6F0F2; --sp-100:#C0DCE3; --sp-500:#005D7C; --sp-700:#01435A;
+            --rd-50:  #FFF5F4; --rd-100:#FFD5D2; --rd-500:#FF3D33; --rd-700:#B42B23;
+            --gn-50:  #F3FCF7; --gn-100:#C6F0D8; --gn-500:#178942; --gn-700:#0D5C2C;
+            --pu-50:  #F5F3FF; --pu-500:#6D28D9;
         }
         * { margin:0; padding:0; box-sizing:border-box; }
         body {
@@ -1644,13 +1737,12 @@ def index():
         /* ── Layout ── */
         .main {
             display: grid;
-            grid-template-columns: 400px 1fr;
+            grid-template-columns: 380px 1fr;
             gap: 20px;
-            padding: 24px;
-            max-width: 1160px;
-            margin: 0 auto;
+            padding: 20px 24px;
+            align-items: start;
         }
-        @media (max-width:800px) {
+        @media (max-width:900px) {
             .main { grid-template-columns:1fr; }
             .runs-list { max-height:360px; }
         }
@@ -1897,6 +1989,7 @@ def index():
         .run-actions { display:flex; flex-direction:column; align-items:flex-end; gap:4px; }
 
         /* ── Quality Report panel ─────────────────────────────── */
+        /* ── Quality Report panel ─────────────────────────────── */
         .qr-panel {
             margin-top:12px;
             border:1px solid var(--kn-border);
@@ -1916,12 +2009,64 @@ def index():
             border-radius:20px; letter-spacing:.02em;
         }
         .qr-body   { padding:12px 14px; display:flex; flex-direction:column; gap:10px; }
-        .qr-value-banner {
-            padding:8px 10px; border-radius:6px;
-            background:var(--kn-gray-50); border:1px solid var(--kn-border);
+
+        /* ── KPI row ── */
+        .kpi-row {
+            display:grid; grid-template-columns:repeat(4,1fr); gap:8px;
         }
-        .qr-value-detail { font-size:13px; font-weight:600; color:var(--kn-gray-700); }
-        .qr-value-sub { font-size:11px; color:var(--kn-gray-400); margin-top:3px; }
+        .kpi-card {
+            background:var(--kn-gray-50); border:1px solid var(--kn-border);
+            border-radius:7px; padding:10px 10px 8px;
+        }
+        .kpi-lbl {
+            font-size:9px; font-weight:700; letter-spacing:.07em;
+            text-transform:uppercase; color:var(--kn-gray-400); margin-bottom:4px;
+        }
+        .kpi-val {
+            font-size:18px; font-weight:700; color:var(--kn-gray-800);
+            line-height:1; font-variant-numeric:tabular-nums;
+        }
+        .kpi-val.green { color:var(--gn-500); }
+        .kpi-val.red   { color:var(--rd-700); }
+        .kpi-val.amber { color:var(--mg-700); }
+        .kpi-sub {
+            font-size:10px; color:var(--kn-gray-400); margin-top:3px;
+        }
+
+        /* ── Finding cards (Inditex-style severity) ── */
+        .finding {
+            border-left:4px solid var(--kn-border);
+            border-radius:0 6px 6px 0;
+            padding:9px 11px;
+            background:var(--kn-gray-50);
+        }
+        .finding.crit { border-left-color:var(--rd-700); background:var(--rd-50); }
+        .finding.high { border-left-color:var(--rd-500); background:var(--rd-50); }
+        .finding.med  { border-left-color:var(--mg-500); background:var(--mg-50); }
+        .finding.low  { border-left-color:var(--sp-500); background:var(--sp-50); }
+        .finding.info { border-left-color:var(--gn-500); background:var(--gn-50); }
+        .f-head {
+            display:flex; align-items:center; gap:6px; margin-bottom:4px; flex-wrap:wrap;
+        }
+        .f-sev {
+            font-size:9px; font-weight:800; letter-spacing:.06em;
+            text-transform:uppercase; padding:1px 6px; border-radius:20px; color:#fff;
+        }
+        .f-sev.crit,.f-sev.high { background:var(--rd-700); }
+        .f-sev.med               { background:var(--mg-500); }
+        .f-sev.low               { background:var(--sp-500); }
+        .f-sev.info              { background:var(--gn-500); }
+        .f-cat {
+            font-size:10px; font-weight:600; color:var(--kn-gray-600);
+        }
+        .f-loc {
+            font-size:10px; color:var(--kn-gray-400); margin-left:auto;
+        }
+        .f-desc { font-size:11px; color:var(--kn-gray-800); line-height:1.45; }
+        .f-rec  { font-size:10px; color:var(--kn-gray-600); margin-top:3px; }
+        .f-rec::before { content:"→ "; }
+
+        /* ── shared table ── */
         .qr-section-title {
             font-size:11px; font-weight:600; color:var(--kn-gray-600);
             margin-bottom:6px;
@@ -1939,8 +2084,10 @@ def index():
         }
         .qr-table td { padding:5px 6px; border-bottom:1px solid var(--kn-gray-100); }
         .qr-table tr:last-child td { border-bottom:none; }
-        .qr-table .qr-num { text-align:right; }
-        .qr-table td.missing { color:var(--kn-error); font-weight:500; }
+        .qr-table .qr-num { text-align:right; font-variant-numeric:tabular-nums; }
+        .qr-table td.missing { color:var(--rd-700); font-weight:500; }
+        .qr-table td.qr-val-missing { color:var(--rd-700); font-weight:500; font-style:italic; }
+        .qr-table td.qr-val-ok   { color:var(--kn-gray-800); }
         .qr-toggle-btn {
             display:flex; align-items:center; gap:5px;
             background:none; border:none; cursor:pointer;
@@ -1948,7 +2095,134 @@ def index():
             font-weight:500;
         }
         .qr-toggle-btn:hover { opacity:.8; }
-        .qr-breakdown { margin-top:6px; }
+        .qr-lines-scroll {
+            max-height:240px; overflow-y:auto;
+            border:1px solid var(--kn-border); border-radius:5px 5px 0 0;
+        }
+        .qr-lines-scroll .qr-table { margin:0; }
+        .qr-lines-scroll .qr-table th { position:sticky; top:0; z-index:1; }
+        .qr-lines-footer {
+            display:flex; justify-content:space-between; align-items:center;
+            padding:5px 8px; font-size:11px; font-weight:700;
+            color:var(--kn-gray-800); background:var(--kn-gray-100);
+            border:1px solid var(--kn-border); border-top:2px solid var(--kn-border);
+            border-radius:0 0 5px 5px;
+        }
+        .qr-lines-footer .gap-amt { color:var(--rd-700); }
+        .qr-lines-footer .match-amt { color:var(--gn-500); }
+
+        /* ── Right-column tabs (History / Results) ── */
+        .right-col {
+            display:flex; flex-direction:column;
+            background:#fff;
+            border:1px solid var(--kn-border);
+            border-radius:var(--kn-radius-lg);
+            box-shadow:var(--kn-shadow);
+            overflow:hidden;
+            min-height:520px;
+        }
+        .tab-nav {
+            display:flex; align-items:center;
+            border-bottom:1px solid var(--kn-border);
+            background:var(--kn-gray-50);
+            padding:0 16px;
+            gap:0;
+        }
+        .tab-btn {
+            padding:12px 16px;
+            font-size:12px; font-weight:600;
+            color:var(--kn-gray-400);
+            border:none; background:none; cursor:pointer;
+            border-bottom:2px solid transparent;
+            margin-bottom:-1px;
+            transition:color .15s, border-color .15s;
+            display:flex; align-items:center; gap:6px;
+        }
+        .tab-btn:hover { color:var(--kn-gray-800); }
+        .tab-btn.active {
+            color:var(--kn-primary);
+            border-bottom-color:var(--kn-primary);
+        }
+        .tab-pill {
+            font-size:10px; font-weight:700;
+            padding:1px 6px; border-radius:20px;
+            background:var(--kn-gray-200); color:var(--kn-gray-600);
+        }
+        .tab-btn.active .tab-pill {
+            background:var(--kn-primary-light); color:var(--kn-primary);
+        }
+        .tab-panel { display:none; flex:1; overflow:hidden; }
+        .tab-panel.active { display:flex; flex-direction:column; }
+
+        /* ── Results tab content ── */
+        .results-body {
+            padding:20px; display:flex; flex-direction:column; gap:14px;
+            overflow-y:auto; flex:1;
+        }
+        .results-kpi-row {
+            display:grid; grid-template-columns:repeat(4,1fr); gap:12px;
+        }
+        .results-kpi-card {
+            background:var(--kn-gray-50); border:1px solid var(--kn-border);
+            border-radius:8px; padding:14px 16px 12px;
+        }
+        .results-kpi-lbl {
+            font-size:10px; font-weight:700; letter-spacing:.07em;
+            text-transform:uppercase; color:var(--kn-gray-400); margin-bottom:6px;
+        }
+        .results-kpi-val {
+            font-size:26px; font-weight:700; color:var(--kn-gray-800);
+            line-height:1; font-variant-numeric:tabular-nums;
+        }
+        .results-kpi-val.green { color:var(--gn-500); }
+        .results-kpi-val.red   { color:var(--rd-700); }
+        .results-kpi-val.amber { color:var(--mg-700); }
+        .results-kpi-sub { font-size:11px; color:var(--kn-gray-400); margin-top:4px; }
+
+        /* Line detail table — full height */
+        .lines-section { display:flex; flex-direction:column; gap:6px; }
+        .lines-section-title {
+            font-size:11px; font-weight:700; color:var(--kn-gray-600);
+            text-transform:uppercase; letter-spacing:.05em;
+        }
+        .lines-table-wrap {
+            border:1px solid var(--kn-border); border-radius:6px;
+            overflow:hidden;
+        }
+        .lines-table-scroll {
+            max-height:calc(100vh - 420px); min-height:200px;
+            overflow-y:auto;
+        }
+        .lines-table {
+            width:100%; border-collapse:collapse;
+            font-size:12px; color:var(--kn-gray-700);
+        }
+        .lines-table th {
+            text-align:left; padding:7px 10px;
+            background:var(--kn-gray-100);
+            border-bottom:1px solid var(--kn-border);
+            font-weight:600; font-size:10px; color:var(--kn-gray-400);
+            text-transform:uppercase; letter-spacing:.05em;
+            position:sticky; top:0; z-index:1;
+        }
+        .lines-table td {
+            padding:6px 10px; border-bottom:1px solid var(--kn-gray-100);
+            vertical-align:middle;
+        }
+        .lines-table tr:last-child td { border-bottom:none; }
+        .lines-table tr:hover td { background:var(--kn-gray-50); }
+        .lines-table .col-num { text-align:right; font-family:monospace; }
+        .lines-table .col-missing { color:var(--rd-700); font-weight:500; font-style:italic; }
+        .lines-table .col-hts { font-family:monospace; font-size:11px; color:var(--kn-gray-600); }
+        .lines-table-footer {
+            display:flex; justify-content:space-between; align-items:center;
+            padding:8px 10px; font-size:12px; font-weight:700;
+            color:var(--kn-gray-800); background:var(--kn-gray-100);
+            border-top:2px solid var(--kn-border);
+        }
+        .lines-table-footer .foot-gap { color:var(--rd-700); }
+        .lines-table-footer .foot-ok  { color:var(--gn-500); }
+
         .run-del {
             background:none; border:none; cursor:pointer;
             color:var(--kn-gray-300); padding:2px;
@@ -2037,44 +2311,6 @@ def index():
                 <!-- Error alert -->
                 <div class="alert alert-error" id="alertError"></div>
 
-                <!-- Quality Report panel -->
-                <div class="qr-panel" id="qualityPanel" style="display:none;">
-                    <div class="qr-header">
-                        <span class="qr-title">Extraction Quality</span>
-                        <span class="qr-score-badge" id="qrScoreBadge"></span>
-                    </div>
-                    <div class="qr-body">
-                        <!-- Escalation banner (human review needed) -->
-                        <div id="qrEscalateBanner" style="display:none; background:#FEF2F2; border:1px solid #FCA5A5; border-radius:5px; padding:8px 10px;">
-                            <div style="font-size:12px; font-weight:700; color:#DC2626;">🚩 Human review recommended</div>
-                            <div style="font-size:11px; color:#991B1B; margin-top:3px;" id="qrEscalateReasons"></div>
-                        </div>
-                        <!-- Healing activity strip -->
-                        <div id="qrHealStrip" style="display:none; background:#EFF6FF; border:1px solid #BFDBFE; border-radius:5px; padding:7px 10px;">
-                            <div style="font-size:11px; color:#1E40AF;" id="qrHealDetail"></div>
-                        </div>
-                        <!-- Value summary banner -->
-                        <div class="qr-value-banner" id="qrValueBanner">
-                            <div class="qr-value-detail" id="qrValueDetail"></div>
-                            <div class="qr-value-sub" id="qrValueSub"></div>
-                        </div>
-                        <!-- Sequence gap warning -->
-                        <div id="qrGapWrap" style="display:none; background:#FEF9C3; border:1px solid #FDE047; border-radius:5px; padding:8px 10px;">
-                            <div style="font-size:12px; font-weight:600; color:#854D0E;" id="qrGapTitle"></div>
-                            <div style="font-size:11px; color:#713F12; margin-top:2px;" id="qrGapDetail"></div>
-                        </div>
-                        <!-- Missing lines table -->
-                        <div id="qrMissingWrap" style="display:none;">
-                            <div class="qr-section-title" id="qrMissingTitle"></div>
-                            <table class="qr-table">
-                                <thead><tr><th>#</th><th>Description</th><th>HTS Code</th></tr></thead>
-                                <tbody id="qrMissingBody"></tbody>
-                            </table>
-                            <div id="qrMissingMore" style="display:none; font-size:11px; color:var(--kn-gray-400); margin-top:6px; padding-left:4px;"></div>
-                        </div>
-                    </div>
-                </div>
-
                 <!-- Run button -->
                 <button class="btn btn-primary" id="runBtn" style="display:none;" onclick="runExtraction()">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="5 3 19 12 5 21 5 3"/></svg>
@@ -2119,25 +2355,108 @@ def index():
         </div>
     </div>
 
-    <!-- ── Right panel: Run History ─────────────────────── -->
-    <div class="card history-card">
-        <div class="history-header">
-            <span class="card-title">Run History</span>
-            <span class="history-count" id="historyCount">0 runs</span>
+    <!-- ── Right panel: tabbed (History | Results) ────── -->
+    <div class="right-col">
+
+        <!-- Tab nav -->
+        <div class="tab-nav">
+            <button class="tab-btn active" id="tabBtnHistory" onclick="switchTab('history')">
+                Run History
+                <span class="tab-pill" id="historyCount">0</span>
+            </button>
+            <button class="tab-btn" id="tabBtnResults" onclick="switchTab('results')" style="display:none;">
+                Results
+                <span class="tab-pill" id="resultsBadge" style="background:var(--rd-50);color:var(--rd-700);"></span>
+            </button>
         </div>
-        <div class="history-search">
-            <input class="search-input" id="searchInput" type="text"
-                   placeholder="Search by entry number or filename..."
-                   oninput="renderRuns()">
-        </div>
-        <div class="runs-list" id="runsList">
-            <div class="empty-state" id="emptyState">
-                <div class="empty-icon">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+
+        <!-- History tab -->
+        <div class="tab-panel active" id="panelHistory" style="overflow:hidden;">
+            <div class="history-search">
+                <input class="search-input" id="searchInput" type="text"
+                       placeholder="Search by entry number or filename..."
+                       oninput="renderRuns()">
+            </div>
+            <div class="runs-list" id="runsList">
+                <div class="empty-state" id="emptyState">
+                    <div class="empty-icon">
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#94A3B8" stroke-width="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    </div>
+                    <p>No extractions yet.<br>Upload a CBP 7501 to get started.</p>
                 </div>
-                <p>No extractions yet.<br>Upload a CBP 7501 to get started.</p>
             </div>
         </div>
+
+        <!-- Results tab -->
+        <div class="tab-panel" id="panelResults">
+            <div class="results-body" id="qualityPanel">
+
+                <!-- KPI row -->
+                <div class="results-kpi-row">
+                    <div class="results-kpi-card">
+                        <div class="results-kpi-lbl">Lines</div>
+                        <div class="results-kpi-val" id="kpiLines">—</div>
+                        <div class="results-kpi-sub">extracted</div>
+                    </div>
+                    <div class="results-kpi-card">
+                        <div class="results-kpi-lbl">Line Sum</div>
+                        <div class="results-kpi-val" id="kpiLineSum">—</div>
+                        <div class="results-kpi-sub">entered values</div>
+                    </div>
+                    <div class="results-kpi-card">
+                        <div class="results-kpi-lbl">Filed Total</div>
+                        <div class="results-kpi-val" id="kpiShipTotal">—</div>
+                        <div class="results-kpi-sub">block 35</div>
+                    </div>
+                    <div class="results-kpi-card">
+                        <div class="results-kpi-lbl">Gap</div>
+                        <div class="results-kpi-val" id="kpiGap">—</div>
+                        <div class="results-kpi-sub" id="kpiGapSub"></div>
+                    </div>
+                </div>
+
+                <!-- Healing strip -->
+                <div id="qrHealStrip" style="display:none; background:#EFF6FF; border:1px solid #BFDBFE; border-radius:6px; padding:8px 12px;">
+                    <div style="font-size:11px; color:#1E40AF;" id="qrHealDetail"></div>
+                </div>
+
+                <!-- Score badge + findings -->
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:2px;">
+                    <span style="font-size:11px;font-weight:700;color:var(--kn-gray-600);text-transform:uppercase;letter-spacing:.05em;">Findings</span>
+                    <span class="qr-score-badge" id="qrScoreBadge" style="font-size:11px;font-weight:700;padding:2px 10px;border-radius:20px;"></span>
+                </div>
+                <div id="qrFindings" style="display:flex;flex-direction:column;gap:8px;"></div>
+
+                <!-- Line breakdown — always visible, full height -->
+                <div class="lines-section" id="qrLinesWrap" style="display:none;">
+                    <div class="lines-section-title" id="qrLinesTitle">Line Detail</div>
+                    <div class="lines-table-wrap">
+                        <div class="lines-table-scroll">
+                            <table class="lines-table">
+                                <thead>
+                                    <tr>
+                                        <th style="width:44px;">#</th>
+                                        <th>Description</th>
+                                        <th style="width:110px;">HTS Code</th>
+                                        <th class="col-num" style="width:110px;">Entered Value</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="qrLinesBody"></tbody>
+                            </table>
+                        </div>
+                        <div class="lines-table-footer">
+                            <span id="qrLinesCount"></span>
+                            <span>
+                                Line sum &nbsp;<strong id="qrLinesTotalAmt"></strong>
+                                <span id="qrLinesDelta" style="margin-left:8px;font-size:11px;"></span>
+                            </span>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </div>
+
     </div>
 
 </div>
@@ -2149,6 +2468,14 @@ const STORAGE_KEY = 'kn_7501_runs';
 
 // ── Init ──────────────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', () => { loadRuns(); renderRuns(); });
+
+// ── Tab switching ─────────────────────────────────────────────────────────
+function switchTab(name) {
+    ['history','results'].forEach(t => {
+        document.getElementById('tabBtn' + t.charAt(0).toUpperCase() + t.slice(1))?.classList.toggle('active', t === name);
+        document.getElementById('panel'  + t.charAt(0).toUpperCase() + t.slice(1))?.classList.toggle('active', t === name);
+    });
+}
 
 // ── Upload zone ───────────────────────────────────────────────────────────
 const uploadZone = document.getElementById('uploadZone');
@@ -2270,7 +2597,12 @@ async function runExtraction() {
         document.getElementById('alertSuccessDetail').textContent = detailText;
         document.getElementById('alertSuccessDetail').style.whiteSpace = 'pre-line';
         show('alertSuccess');
+        window._lastValueAudit = valueAudit;
         renderQualityPanel(valueAudit, lineCount, confidence, healLog);
+        // Show Results tab and switch to it
+        const resultsTabBtn = document.getElementById('tabBtnResults');
+        resultsTabBtn.style.display = 'flex';
+        switchTab('results');
         document.getElementById('newRunBtn').style.display = 'flex';
         document.getElementById('fileChip').classList.remove('show');
 
@@ -2294,7 +2626,7 @@ function renderRuns() {
     const q      = (document.getElementById('searchInput')?.value || '').toLowerCase();
     const list   = document.getElementById('runsList');
     const badge  = document.getElementById('historyCount');
-    badge.textContent = `${runs.length} run${runs.length!==1?'s':''}`;
+    badge.textContent = runs.length;
 
     const filtered = q ? runs.filter(r =>
         (r.entry_number||'').toLowerCase().includes(q) ||
@@ -2433,15 +2765,15 @@ function computeConfidence(va, lineCount) {
     const stotal  = va.shipment_total || 0;
     const lsum    = va.line_sum || 0;
 
-    if (va.match) return { score: 100, label:'Match', color:'#16A34A', bg:'#DCFCE7' };
+    if (va.match) return { score: 100, label:'Match', color:'var(--gn-500)', bg:'var(--gn-50)' };
 
     const coverage = stotal > 0 ? Math.min(1, lsum / stotal) : (missing === 0 ? 1 : 0);
     let score = Math.round(coverage * 80);
     score += Math.round(((total - missing) / total) * 20);
     score = Math.max(0, Math.min(99, score));
     const label = score >= 90 ? 'Good' : score >= 60 ? 'Partial' : 'Incomplete';
-    const color = score >= 90 ? '#16A34A' : score >= 60 ? '#D97706' : '#DC2626';
-    const bg    = score >= 90 ? '#DCFCE7' : score >= 60 ? '#FEF3C7' : '#FEE2E2';
+    const color = score >= 90 ? 'var(--gn-500)' : score >= 60 ? 'var(--mg-700)' : 'var(--rd-700)';
+    const bg    = score >= 90 ? 'var(--gn-50)'  : score >= 60 ? 'var(--mg-50)'  : 'var(--rd-50)';
     return { score, label, color, bg };
 }
 
@@ -2450,43 +2782,176 @@ function fmt$(n) {
     return '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
 }
 
-function renderQualityPanel(va, lineCount, confidence, healLog) {
-    const panel = document.getElementById('qualityPanel');
-    if (!va) { panel.style.display = 'none'; return; }
+function buildFindings(va, lineCount) {
+    const findings = [];
+    const missing  = va.missing_value_lines || [];
+    const seqGaps  = va.sequence_gaps || [];
+    const lsum     = va.line_sum || 0;
+    const stotal   = va.shipment_total;
+    const absgap   = va.gap != null ? Math.abs(va.gap) : 0;
+    const gapPct   = stotal > 0 ? (absgap / stotal * 100) : 0;
 
-    // Prefer orchestrator's confidence score; fall back to computed
-    const conf = confidence || computeConfidence(va, lineCount);
-    const score = conf.score ?? null;
-    const label = conf.label || 'N/A';
-    const color = conf.color || '#475569';
-    const bg    = conf.bg    || '#F1F5F9';
-    const missing = va.missing_value_lines || [];
-    const SHOW_MAX = 15;
-
-    // Score badge
-    const badge = document.getElementById('qrScoreBadge');
-    badge.textContent = score != null ? `${label}  ${score}%` : 'N/A';
-    badge.style.background = bg;
-    badge.style.color = color;
-
-    // Escalation banner
-    const escalateBanner = document.getElementById('qrEscalateBanner');
-    if (conf.escalate && conf.reasons && conf.reasons.length > 0) {
-        document.getElementById('qrEscalateReasons').textContent = conf.reasons.join('  ·  ');
-        escalateBanner.style.display = 'block';
-    } else {
-        escalateBanner.style.display = 'none';
+    // --- CRITICAL: agent skipped whole line items (sequence gaps) ---
+    if (seqGaps.length > 0) {
+        const totalSkipped = seqGaps.reduce((s, g) => s + g.count, 0);
+        const ranges = seqGaps.map(g =>
+            g.from === g.to ? `Item ${g.from}` : `Items ${g.from}–${g.to}`
+        ).join(', ');
+        findings.push({
+            sev:'Critical', cls:'crit',
+            cat:'Extraction integrity',
+            loc:`${totalSkipped} item${totalSkipped !== 1 ? 's' : ''} skipped`,
+            desc:`Agent response is missing ${totalSkipped} line item${totalSkipped !== 1 ? 's' : ''} — the extraction is incomplete. Missing: ${ranges}.`,
+            rec:'Re-run extraction. If the issue persists, use Manual Recovery to upload the agent JSON directly.'
+        });
     }
 
-    // Healing activity strip
-    const healStrip = document.getElementById('qrHealStrip');
-    const healEvents = (healLog || []).filter(e => e.event === 'gap_recovery' || e.event === 'value_recovery');
+    // --- HIGH / MEDIUM: value gap ---
+    if (!va.match && va.gap != null && stotal != null) {
+        const sev = gapPct >= 2 ? 'High' : 'Medium';
+        const cls = gapPct >= 2 ? 'high' : 'med';
+        if (missing.length === 0) {
+            // All values were extracted but they don't add up → wrong value on a line
+            findings.push({
+                sev, cls,
+                cat:'Entered value reconciliation',
+                loc:`Gap ${fmt$(absgap)} (${gapPct.toFixed(2)}%)`,
+                desc:`All ${lineCount || (va.line_breakdown||[]).length} lines have an entered value, but the line sum (${fmt$(lsum)}) does not match the filed shipment total (${fmt$(stotal)}). One or more lines likely has an incorrect value. Review the line breakdown below to identify the discrepancy.`,
+                rec:"Compare each line's extracted value against the source 7501 document. Look for a line where the extracted amount differs from what appears on the form."
+            });
+        } else {
+            findings.push({
+                sev, cls,
+                cat:'Entered value reconciliation',
+                loc:`Gap ${fmt$(absgap)} · ${missing.length} missing`,
+                desc:`Line sum (${fmt$(lsum)}) does not match the filed shipment total (${fmt$(stotal)}). ${missing.length} line${missing.length !== 1 ? 's are' : ' is'} missing an entered value, which accounts for part of the gap.`,
+                rec:'Re-run extraction or manually supply entered values for the lines listed below.'
+            });
+        }
+    } else if (!va.match && va.gap != null && stotal == null) {
+        // Gap but no shipment total to compare
+        findings.push({
+            sev:'Medium', cls:'med',
+            cat:'Entered value reconciliation',
+            loc:`No filed total found`,
+            desc:`${missing.length} line${missing.length !== 1 ? 's are' : ' is'} missing an entered value. Line sum: ${fmt$(lsum)}. No shipment total (Block 35) was found in the agent response to compare against.`,
+            rec:'Ensure the agent extracts the total entered value from Block 35 of the 7501. Re-run if needed.'
+        });
+    }
+
+    // --- MEDIUM: missing value lines (when there is no gap finding already) ---
+    if (missing.length > 0 && (va.match || va.gap == null)) {
+        const sample = missing.slice(0, 5).map(m => `#${m.line_number}`).join(', ');
+        const more   = missing.length > 5 ? ` +${missing.length - 5} more` : '';
+        findings.push({
+            sev:'Medium', cls:'med',
+            cat:'Missing entered values',
+            loc:`${missing.length} line${missing.length !== 1 ? 's' : ''}`,
+            desc:`${missing.length} line item${missing.length !== 1 ? 's are' : ' is'} missing an entered value in the agent response: ${sample}${more}.`,
+            rec:'Check whether the source document contains entered values for these lines. Re-run or manually correct the JSON.'
+        });
+    }
+
+    // --- INFO: clean extraction ---
+    if (va.match && seqGaps.length === 0 && missing.length === 0) {
+        findings.push({
+            sev:'Info', cls:'info',
+            cat:'Reconciliation',
+            loc:`${lineCount || (va.line_breakdown||[]).length} lines`,
+            desc:`All line values sum to ${fmt$(stotal)} — exact match with the filed shipment total. No gaps or missing values detected.`,
+            rec:''
+        });
+    }
+
+    return findings;
+}
+
+function renderFindingCard(f) {
+    return `<div class="finding ${f.cls}">
+        <div class="f-head">
+            <span class="f-sev ${f.cls}">${f.sev}</span>
+            <span class="f-cat">${f.cat}</span>
+            <span class="f-loc">${f.loc}</span>
+        </div>
+        <div class="f-desc">${f.desc}</div>
+        ${f.rec ? `<div class="f-rec">${f.rec}</div>` : ''}
+    </div>`;
+}
+
+function renderQualityPanel(va, lineCount, confidence, healLog) {
+    if (!va) return;
+
+    const conf    = confidence || computeConfidence(va, lineCount);
+    const score   = conf.score ?? null;
+    const label   = conf.label || 'N/A';
+    const missing = va.missing_value_lines || [];
+    const lsum    = va.line_sum || 0;
+    const stotal  = va.shipment_total;
+    const absgap  = va.gap != null ? Math.abs(va.gap) : null;
+
+    // --- Score badge ---
+    const badge = document.getElementById('qrScoreBadge');
+    badge.textContent = score != null ? `${label}  ${score}%` : 'N/A';
+    badge.style.background = conf.bg    || '#F1F5F9';
+    badge.style.color      = conf.color || '#475569';
+
+    // --- Results tab badge ---
+    const rbadge = document.getElementById('resultsBadge');
+    if (rbadge) {
+        if (va.match) {
+            rbadge.textContent = 'OK';
+            rbadge.style.background = 'var(--gn-50)'; rbadge.style.color = 'var(--gn-500)';
+        } else if (absgap != null) {
+            rbadge.textContent = 'Gap';
+            rbadge.style.background = 'var(--rd-50)'; rbadge.style.color = 'var(--rd-700)';
+        } else {
+            rbadge.textContent = '!';
+        }
+    }
+
+    // --- KPI cards ---
+    const total = lineCount || (va.line_breakdown || []).length;
+    document.getElementById('kpiLines').textContent = total || '—';
+
+    const kpiSum = document.getElementById('kpiLineSum');
+    kpiSum.textContent = lsum > 0
+        ? '$' + lsum.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+        : '—';
+    kpiSum.className = 'results-kpi-val';
+
+    const kpiST = document.getElementById('kpiShipTotal');
+    kpiST.textContent = stotal != null
+        ? '$' + Number(stotal).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+        : '—';
+    kpiST.className = 'results-kpi-val';
+
+    const kpiGap    = document.getElementById('kpiGap');
+    const kpiGapSub = document.getElementById('kpiGapSub');
+    if (va.match) {
+        kpiGap.textContent   = '$0.00';
+        kpiGap.className     = 'results-kpi-val green';
+        kpiGapSub.textContent = 'exact match';
+    } else if (absgap != null) {
+        const gapPct = stotal > 0 ? (absgap / stotal * 100) : 0;
+        kpiGap.textContent   = '$' + absgap.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+        kpiGap.className     = 'results-kpi-val ' + (gapPct >= 2 ? 'red' : 'amber');
+        kpiGapSub.textContent = stotal > 0 ? gapPct.toFixed(2) + '% of total' : '';
+    } else {
+        kpiGap.textContent   = '—';
+        kpiGap.className     = 'results-kpi-val';
+        kpiGapSub.textContent = missing.length > 0
+            ? `${missing.length} value${missing.length !== 1 ? 's' : ''} missing`
+            : 'no total to compare';
+    }
+
+    // --- Healing strip ---
+    const healStrip  = document.getElementById('qrHealStrip');
+    const healEvents = (healLog || []).filter(e =>
+        e.event === 'gap_recovery' || e.event === 'value_recovery');
     if (healEvents.length > 0) {
         const parts = healEvents.map(e => {
-            if (e.event === 'gap_recovery')
-                return `↑ ${e.data.items_recovered || 0} missing item(s) recovered`;
-            if (e.event === 'value_recovery')
-                return `↑ ${e.data.values_filled || 0} value(s) filled`;
+            if (e.event === 'gap_recovery')   return `↑ ${e.data.items_recovered || 0} item(s) recovered`;
+            if (e.event === 'value_recovery') return `↑ ${e.data.values_filled || 0} value(s) filled`;
             return '';
         }).filter(Boolean);
         document.getElementById('qrHealDetail').textContent = '⚡ Self-healed: ' + parts.join('  ·  ');
@@ -2495,72 +2960,58 @@ function renderQualityPanel(va, lineCount, confidence, healLog) {
         healStrip.style.display = 'none';
     }
 
-    // Value banner
-    const banner = document.getElementById('qrValueBanner');
-    const vd = document.getElementById('qrValueDetail');
-    const vs = document.getElementById('qrValueSub');
-    if (va.match) {
-        banner.style.background = '#F0FDF4';
-        banner.style.borderColor = '#86EFAC';
-        vd.innerHTML = `<span style="color:#16A34A;">&#10003; Values reconcile</span>`;
-        vs.textContent = `All lines sum to ${fmt$(va.shipment_total)}`;
-    } else if (va.gap != null) {
-        const absgap = Math.abs(va.gap);
-        banner.style.background = '#FEF2F2';
-        banner.style.borderColor = '#FCA5A5';
-        vd.innerHTML = `<span style="color:#DC2626;">&#9888; Gap of ${fmt$(absgap)}</span>`;
-        vs.textContent = `Line sum ${fmt$(va.line_sum)} · Shipment total ${fmt$(va.shipment_total)}`;
-    } else {
-        banner.style.background = 'var(--kn-gray-50)';
-        banner.style.borderColor = 'var(--kn-border)';
-        vd.textContent = 'No shipment total to compare';
-        vs.textContent = `Line sum: ${fmt$(va.line_sum)}`;
-    }
+    // --- Findings ---
+    const findings = buildFindings(va, lineCount);
+    document.getElementById('qrFindings').innerHTML =
+        findings.map(renderFindingCard).join('');
 
-    // Sequence gap warning
-    const seqGaps = va.sequence_gaps || [];
-    const gwrap = document.getElementById('qrGapWrap');
-    if (seqGaps.length > 0) {
-        const totalMissing = seqGaps.reduce((s, g) => s + g.count, 0);
-        document.getElementById('qrGapTitle').textContent =
-            `⚠ Agent skipped ${totalMissing} line item${totalMissing !== 1 ? 's' : ''} — extraction incomplete`;
-        document.getElementById('qrGapDetail').textContent =
-            seqGaps.map(g => g.from === g.to ? `Item ${g.from}` : `Items ${g.from}–${g.to}`).join(', ') +
-            ' not found in agent response. Re-run to attempt re-extraction.';
-        gwrap.style.display = 'block';
-    } else {
-        gwrap.style.display = 'none';
-    }
+    // --- Line breakdown — always shown, no toggle ---
+    const breakdown = va.line_breakdown || [];
+    const lwrap = document.getElementById('qrLinesWrap');
+    if (breakdown.length > 0) {
+        document.getElementById('qrLinesTitle').textContent =
+            `Line Detail  (${breakdown.length} lines)`;
 
-    // Missing lines table (capped at SHOW_MAX rows)
-    const mwrap = document.getElementById('qrMissingWrap');
-    if (missing.length > 0) {
-        document.getElementById('qrMissingTitle').textContent =
-            `${missing.length} line${missing.length !== 1 ? 's' : ''} missing entered value`;
-        const visible = missing.slice(0, SHOW_MAX);
-        document.getElementById('qrMissingBody').innerHTML = visible.map(m => `
-            <tr>
-                <td class="missing">${m.line_number || '—'}</td>
-                <td>${(m.description || '—').substring(0, 50)}${(m.description||'').length > 50 ? '…' : ''}</td>
-                <td>${m.hts_code || '—'}</td>
-            </tr>`).join('');
-        const more = document.getElementById('qrMissingMore');
-        if (missing.length > SHOW_MAX) {
-            more.textContent = `and ${missing.length - SHOW_MAX} more missing lines`;
-            more.style.display = 'block';
+        document.getElementById('qrLinesBody').innerHTML = breakdown.map(b => {
+            const val    = b.entered_value != null
+                ? '$' + Number(b.entered_value).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+                : '—';
+            const valCls = b.entered_value == null ? 'col-num col-missing' : 'col-num';
+            return `<tr>
+                <td>${b.line_number || '—'}</td>
+                <td>${(b.description || '—').substring(0,55)}${(b.description||'').length > 55 ? '…' : ''}</td>
+                <td class="col-hts">${b.hts_code || '—'}</td>
+                <td class="${valCls}">${val}</td>
+            </tr>`;
+        }).join('');
+
+        // Footer: line sum + delta vs shipment total
+        document.getElementById('qrLinesCount').textContent =
+            `${breakdown.length} line${breakdown.length !== 1 ? 's' : ''}`;
+        const footAmt   = document.getElementById('qrLinesTotalAmt');
+        footAmt.textContent =
+            '$' + Number(lsum).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+        const delta = document.getElementById('qrLinesDelta');
+        if (stotal != null && absgap != null && !va.match) {
+            delta.textContent = `vs filed $${Number(stotal).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}  →  Δ $${absgap.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`;
+            delta.className   = 'foot-gap';
+        } else if (va.match) {
+            delta.textContent = '✓ matches filed total';
+            delta.className   = 'foot-ok';
         } else {
-            more.style.display = 'none';
+            delta.textContent = '';
         }
-        mwrap.style.display = 'block';
-    } else {
-        mwrap.style.display = 'none';
-    }
 
-    panel.style.display = 'block';
+        lwrap.style.display = 'block';
+    } else {
+        lwrap.style.display = 'none';
+    }
 }
 
 function hideQualityPanel() {
-    document.getElementById('qualityPanel').style.display = 'none';
+    // Switch back to history tab (results stay available)
+    switchTab('history');
 }
 </script>
 </body>
@@ -2756,6 +3207,7 @@ def audit_line_values(raw_data: Dict) -> Dict:
                     if phts.get(field) is not None:
                         entered_value = phts[field]
                         break
+
 
             # HTS code — prefer the actual classification code over Chapter 99 fee codes
             # Chapter 99 (9901.xx – 9999.xx) are special-provision tariffs, not product HTS codes
@@ -3186,6 +3638,7 @@ def process_single_pdf(filepath: str, filename: str) -> Dict[str, Any]:
                 a79_custom_instructions=API1_CUSTOM_INSTRUCTIONS,
                 claude_api_key=CLAUDE_API_KEY,
                 claude_model=CLAUDE_MODEL,
+                self_healing_instructions=SELF_HEALING_AGENT_INSTRUCTIONS,
             )
             result = orch.run(
                 filepath, filename,
@@ -3468,5 +3921,5 @@ if __name__ == '__main__':
     print(f"\n⚠️  Press CTRL+C to stop")
     print("="*80 + "\n")
     
-    app.run(debug=True, host='0.0.0.0', port=5002,
-            extra_files=[_prompt_file])
+    app.run(debug=not PLAYGROUND, host='0.0.0.0', port=5002,
+            extra_files=[_prompt_file, _self_healing_prompt_file] if not PLAYGROUND else None)
